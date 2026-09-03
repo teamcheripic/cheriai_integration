@@ -1,0 +1,82 @@
+# =============================================================================
+# CheriPic — Render blueprint (PRODUCTION)
+# =============================================================================
+# Designed for:
+#   • 24/7 uptime, no idle sleep
+#   • Many concurrent users (autoscales 1 → 4 instances under CPU pressure)
+#   • Global traffic from a single region (pick the one nearest your Supabase
+#     project — see "region" field below)
+#   • CPU + I/O mixed load (chat = I/O, face match = CPU)
+#
+# Services:
+#   1. cheripic-api    — FastAPI web app, autoscaled, 2 workers per instance
+#   2. cheripic-daily  — Scheduled cron for daily emails
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. Web API
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: cheripic-api
+    runtime: docker
+    dockerfilePath: ./ai_integration/fastapi/Dockerfile
+    dockerContext: ./ai_integration/fastapi
+    plan: standard            # 1 CPU, 2 GB RAM, $25/mo. Always-on, no sleep.
+                              # Bump to `pro` later for autoscaling + 2 CPUs.
+    region: singapore         # CHANGE to your Supabase region (singapore /
+                              # frankfurt / oregon / virginia / ohio)
+    healthCheckPath: /
+    autoDeploy: true          # push to main → rolling redeploy, zero downtime
+
+    # ----- Single-worker uvicorn -----
+    # Standard has 1 CPU. Python's GIL serializes one worker per core for
+    # CPU work, so --workers 1 is correct here (more workers would just
+    # context-switch without throughput gain on a single-CPU box). Async
+    # I/O (OpenAI calls, Supabase queries) still concurrent within the worker.
+    dockerCommand: "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1 --proxy-headers --forwarded-allow-ips=*"
+
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: FRONTEND_URLS
+        # ALL production origins, comma-separated, no spaces. Add every
+        # domain your PWA is served from.
+        value: "https://arkxpert.com,https://www.arkxpert.com"
+      - key: PORT
+        value: "8000"
+
+  # ---------------------------------------------------------------------------
+  # 2. Daily email cron
+  # ---------------------------------------------------------------------------
+  # Spins up at 08:00 UTC, runs cron_daily_email.py, exits. Cheap because it
+  # only bills for actual compute seconds. Schedule is UTC — use crontab.guru
+  # to translate.
+  - type: cron
+    name: cheripic-daily
+    runtime: docker
+    dockerfilePath: ./ai_integration/fastapi/Dockerfile
+    dockerContext: ./ai_integration/fastapi
+    plan: starter
+    region: singapore         # keep matched to the api region
+    schedule: "0 8 * * *"     # 08:00 UTC = 13:30 IST = midnight PT
+    dockerCommand: "python cron_daily_email.py"
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: APP_BASE_URL
+        value: "https://arkxpert.com"

@@ -1,0 +1,7 @@
+# Test-only dependencies. Install with:
+#   pip install -r requirements.dev.txt
+# Run tests with:
+#   pytest
+pytest>=9,<10
+pytest-asyncio>=1,<2
+respx>=0.23,<0.24

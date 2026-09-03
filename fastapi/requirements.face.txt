@@ -1,0 +1,25 @@
+# =============================================================================
+# CheriPic FastAPI — FACE MATCH requirements (ML stack, VPS/Render only)
+# =============================================================================
+# Install this ON TOP of requirements.core.txt on hosts that have:
+#   • gcc + python3-dev headers (insightface needs to compile a Cython ext)
+#   • ≥ 1 GB RAM (peak install + inference memory)
+#   • Disk for ~280 MB of model weights cached under ~/.insightface
+#
+# Confirmed working: Render Standard, Railway, DigitalOcean Droplet 1 GB+,
+# AWS EC2 t3.small+, Fly.io shared-cpu-1x with 1 GB RAM.
+#
+# Confirmed NOT working: GoDaddy cPanel shared, Render Free, Heroku Free.
+# When this file is skipped the /kyc/verify-face endpoint returns a clean
+# HTTP 503 ("Face verification is temporarily unavailable on this server.")
+# and every other endpoint keeps working — see main.py:368.
+#
+# Install:
+#   pip install -r requirements.core.txt
+#   pip install -r requirements.face.txt
+# =============================================================================
+
+insightface>=0.7.3
+onnxruntime>=1.24
+opencv-python-headless>=4.10
+numpy>=1.26

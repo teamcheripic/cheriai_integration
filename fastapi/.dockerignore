@@ -1,0 +1,18 @@
+# Don't ship your local Python virtualenv — it's ~1.5 GB of compiled wheels
+# for the wrong Python / wrong platform, and breaks the build every time.
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor & local-only files
+.env
+.env.local
+.env.*.local
+*.log
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,17 @@
+# =============================================================================
+# CheriPic FastAPI — ALL-IN-ONE requirements (full deploys, VPS / Docker)
+# =============================================================================
+# This is the union of:
+#   requirements.core.txt — FastAPI + DB + Stripe + OpenAI (cPanel-safe)
+#   requirements.face.txt — insightface ML stack (needs gcc + 1 GB RAM)
+#
+# Use this file on hosts where you want the full feature set (Render,
+# Railway, DigitalOcean, EC2). On GoDaddy cPanel / other shared Python
+# hosting, point the cPanel "requirements.txt" setting at
+# requirements.core.txt instead — the /kyc/verify-face endpoint will
+# return a clean 503 and everything else (chat / billing / membership /
+# admin) keeps working.
+# =============================================================================
+
+-r requirements.core.txt
+-r requirements.face.txt
