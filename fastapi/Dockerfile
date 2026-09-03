@@ -1,18 +1,15 @@
 # =============================================================================
-# CheriPic FastAPI — production image (CORE build)
+# CheriPic FastAPI — production image (FULL build, with face match)
 # =============================================================================
-# Installs requirements.core.txt only: FastAPI + Supabase + Stripe + OpenAI.
-# Everything is a pure-Python or manylinux wheel, so no compiler is needed and
-# the image lands around ~250 MB instead of multiple GB.
+# Installs requirements.txt: the core API stack plus the insightface ML stack
+# for /kyc/verify-face. Needs a compiler and bakes in ~280 MB of model weights,
+# so expect a ~10-20 min build, a multi-GB image, and >= 1 GB RAM at runtime.
 #
-# /kyc/verify-face returns a clean 503 in this build — face_verification.py
-# lazily imports insightface and raises FaceServiceUnavailable when it's
-# missing. Every other route (chat, billing, membership, admin) is unaffected.
-#
-# TO RE-ENABLE FACE MATCH: swap requirements.core.txt for requirements.txt in
-# the two lines marked ⬇ FACE below, and uncomment the build-essential /
-# libgl1 apt block plus the model-warmup RUN. Budget ~15 min of build time,
-# a multi-GB image, and >= 1 GB RAM at runtime.
+# TO GO BACK TO THE LIGHT BUILD: point the COPY and pip install at
+# requirements.core.txt, and comment out the apt block and the model warmup.
+# /kyc/verify-face then returns a clean 503 — face_verification.py imports
+# insightface lazily and raises FaceServiceUnavailable — and every other
+# route (chat, billing, membership, admin) is unaffected.
 #
 # Listens on $PORT (Render / Railway / Fly inject this).
 # =============================================================================
@@ -26,23 +23,32 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# ⬇ FACE — uncomment for the full ML stack:
+# Full ML stack build deps:
 #   build-essential — compiles insightface's Cython extension
 #   libgl1, libglib2.0-0 — required by opencv-python-headless at runtime
-# RUN apt-get update && apt-get install -y --no-install-recommends \
-#       build-essential libgl1 libglib2.0-0 \
-#     && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
 
-# ⬇ FACE — change both to requirements.txt for the full stack.
-COPY requirements.core.txt ./
+# requirements.txt is `-r requirements.core.txt` + `-r requirements.face.txt`,
+# so all three files must be present before pip runs.
+COPY requirements.txt requirements.core.txt requirements.face.txt ./
+
+# Installed in three steps rather than one `-r requirements.txt`, because
+# insightface's setup.py imports numpy and Cython at build time. Under pip's
+# default build isolation those aren't visible to the build env and the install
+# fails with ModuleNotFoundError. So: seed the build deps, install the core
+# stack, then install the ML stack with isolation off so it can see them.
+RUN pip install cython numpy
 RUN pip install -r requirements.core.txt
+RUN pip install --no-build-isolation -r requirements.face.txt
 
-# ⬇ FACE — uncomment to pre-download the buffalo_l model pack (~280 MB) so the
-# first /kyc/verify-face call doesn't stall on the download.
-# RUN python -c "from insightface.app import FaceAnalysis; \
-#     a = FaceAnalysis(name='buffalo_l', allowed_modules=['detection','recognition']); \
-#     a.prepare(ctx_id=-1, det_size=(640, 640))" \
-#     || echo "insightface model warmup failed — first /kyc call will be slow but functional"
+# Pre-download the buffalo_l model pack (~280 MB) so the first /kyc/verify-face
+# call doesn't stall on the download.
+RUN python -c "from insightface.app import FaceAnalysis; \
+    a = FaceAnalysis(name='buffalo_l', allowed_modules=['detection','recognition']); \
+    a.prepare(ctx_id=-1, det_size=(640, 640))" \
+    || echo "insightface model warmup failed — first /kyc call will be slow but functional"
 
 COPY . .
 
