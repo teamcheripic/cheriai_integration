@@ -210,6 +210,7 @@ async def _upsert_active_membership(
     stripe_customer_id: Optional[str] = None,
     stripe_subscription_id: Optional[str] = None,
     stripe_price_id: Optional[str] = None,
+    current_period_start: Optional[datetime] = None,
     current_period_end: Optional[datetime] = None,
     cancel_at_period_end: Optional[bool] = None,
     last_invoice_status: Optional[str] = None,
@@ -243,6 +244,11 @@ async def _upsert_active_membership(
         payload["stripe_subscription_id"] = stripe_subscription_id
     if stripe_price_id:
         payload["stripe_price_id"] = stripe_price_id
+    # current_period_start anchors the message-quota window — see
+    # get_quota_period(). Without it a subscriber silently falls back to
+    # calendar-month resets.
+    if current_period_start:
+        payload["current_period_start"] = current_period_start.isoformat()
     if current_period_end:
         payload["current_period_end"] = current_period_end.isoformat()
         payload["expires_at"] = current_period_end.isoformat()
@@ -379,6 +385,8 @@ async def _handle_subscription_active(sub: dict) -> None:
         logger.warning("Unknown price_id %s on subscription %s", price_id, sub.get("id"))
         return
 
+    cps = sub.get("current_period_start")
+    cps_dt = datetime.fromtimestamp(cps, tz=timezone.utc) if cps else None
     cpe = sub.get("current_period_end")
     cpe_dt = datetime.fromtimestamp(cpe, tz=timezone.utc) if cpe else None
 
@@ -395,6 +403,7 @@ async def _handle_subscription_active(sub: dict) -> None:
         stripe_customer_id=sub.get("customer"),
         stripe_subscription_id=sub.get("id"),
         stripe_price_id=price_id,
+        current_period_start=cps_dt,
         current_period_end=cpe_dt,
         cancel_at_period_end=bool(sub.get("cancel_at_period_end")),
         last_invoice_status=status,
@@ -411,6 +420,7 @@ async def _handle_subscription_cancelled(sub: dict) -> None:
         tier="basic",
         stripe_customer_id=sub.get("customer"),
         stripe_subscription_id=None,
+        current_period_start=None,
         stripe_price_id=None,
         current_period_end=None,
         cancel_at_period_end=False,
@@ -439,39 +449,104 @@ def _utc_today_iso() -> str:
     return datetime.now(timezone.utc).date().isoformat()
 
 
-async def get_daily_usage(user_id: str) -> int:
-    """Returns today's messages_sent count (UTC date)."""
+def _utc_month_start_iso() -> str:
+    """First day of the current UTC calendar month, as an ISO date."""
+    return datetime.now(timezone.utc).date().replace(day=1).isoformat()
+
+
+async def get_quota_period(user_id: str) -> dict:
+    """
+    Resolve the message-quota window for a user.
+
+    Subscribers are anchored to their Stripe billing cycle, so a user who
+    subscribed on the 12th resets on the 12th rather than on the 1st. Users
+    with no active subscription (basic tier) have no cycle to anchor to and
+    fall back to the UTC calendar month.
+
+    Returns:
+        {
+          "period_start": "YYYY-MM-DD",   # doubles as the usage row key
+          "period_end":   ISO8601 | None, # None for calendar-month fallback
+          "source":       "billing_cycle" | "calendar_month",
+        }
+
+    Falls back to the calendar month on any lookup failure — a Supabase blip
+    must not hand someone an unlimited quota or lock them out entirely.
+    """
+    try:
+        rows = await supabase.select(
+            "user_memberships",
+            columns="current_period_start,current_period_end",
+            eq={"user_id": user_id, "is_active": True},
+            limit=1,
+        )
+    except Exception as e:
+        logger.warning("quota period lookup failed for %s: %r", user_id, e)
+        rows = []
+
+    start_raw = rows[0].get("current_period_start") if rows else None
+    end_raw = rows[0].get("current_period_end") if rows else None
+
+    if start_raw:
+        try:
+            start_dt = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+            end_dt = (
+                datetime.fromisoformat(str(end_raw).replace("Z", "+00:00"))
+                if end_raw
+                else None
+            )
+            # A period that already ended means the webhook hasn't advanced the
+            # row yet (renewal in flight, or a cancelled sub). Falling through
+            # to the calendar month is the safe read: the user keeps a quota
+            # rather than being stuck against a stale, exhausted window.
+            if end_dt is None or end_dt > datetime.now(timezone.utc):
+                return {
+                    "period_start": start_dt.date().isoformat(),
+                    "period_end": end_dt.isoformat() if end_dt else None,
+                    "source": "billing_cycle",
+                }
+        except (ValueError, TypeError) as e:
+            logger.warning("Unparseable billing period for %s: %r", user_id, e)
+
+    return {
+        "period_start": _utc_month_start_iso(),
+        "period_end": None,
+        "source": "calendar_month",
+    }
+
+
+async def get_period_usage(user_id: str, period_start: str) -> int:
+    """Messages sent by this user within the given quota period."""
     rows = await supabase.select(
-        "cheri_ai_daily_usage",
+        "cheri_ai_usage_periods",
         columns="messages_sent",
-        eq={"user_id": user_id, "usage_date": _utc_today_iso()},
+        eq={"user_id": user_id, "period_start": period_start},
         limit=1,
     )
     return int(rows[0]["messages_sent"]) if rows else 0
 
 
-async def increment_daily_usage(user_id: str) -> int:
+async def increment_period_usage(user_id: str, period_start: str) -> int:
     """
-    Atomically bump today's counter (upsert with merge-duplicates) and
-    return the new count. Two concurrent /chat calls can both succeed and
-    end up at +2 — that's fine; we tolerate ±1 around the cap.
+    Bump this period's counter (upsert with merge-duplicates) and return the
+    new count. Two concurrent /chat calls can both succeed and end up at +2 —
+    that's fine; we tolerate ±1 around the cap.
     """
-    today = _utc_today_iso()
-    current = await get_daily_usage(user_id)
+    current = await get_period_usage(user_id, period_start)
     new_count = current + 1
     try:
         await supabase.upsert(
-            "cheri_ai_daily_usage",
+            "cheri_ai_usage_periods",
             {
                 "user_id": user_id,
-                "usage_date": today,
+                "period_start": period_start,
                 "messages_sent": new_count,
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             },
-            on_conflict="user_id,usage_date",
+            on_conflict="user_id,period_start",
         )
     except Exception as e:
-        logger.warning("daily usage upsert failed for %s: %s", user_id, e)
+        logger.warning("period usage upsert failed for %s: %s", user_id, e)
     return new_count
 
 

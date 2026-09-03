@@ -40,7 +40,7 @@ from user_memory import (
     seed_memory_from_profile,
 )
 from face_verification import compare_faces, FaceServiceUnavailable
-from tier_limits import CHERI_AI_DAILY_LIMITS, STRIPE_PRICE_TO_TIER
+from tier_limits import get_monthly_limits, STRIPE_PRICE_TO_TIER, describe_limits
 import billing
 
 logging.basicConfig(
@@ -92,10 +92,17 @@ class ChatResponse(BaseModel):
     stage: str
     timestamp: str
     # Membership-aware usage info so the UI can render "N messages left
-    # today" and upsell to upgrade when the user gets close to the cap.
+    # this period" and upsell to upgrade when the user gets close to the cap.
     tier: str
+    monthly_used: int
+    monthly_limit: Optional[int] = None  # None = unlimited
+    period_start: Optional[str] = None   # ISO date the quota window opened
+    period_end: Optional[str] = None     # ISO8601, None on calendar-month fallback
+    # Deprecated: same values as monthly_used / monthly_limit. Kept so the
+    # current frontend keeps rendering during the migration — remove once
+    # membership.ts reads the monthly_* fields.
     daily_used: int
-    daily_limit: Optional[int] = None  # None = unlimited (Premium)
+    daily_limit: Optional[int] = None
     # NOTE: we intentionally do NOT echo the user profile (email, phone, KYC
     # URLs, bio, etc.) on every reply. The frontend already has that.
 
@@ -177,6 +184,13 @@ async def lifespan(app: FastAPI):
     # webhook handler knows which tier to grant for each price_id.
     billing._register_price_to_tier_mapping(STRIPE_PRICE_TO_TIER)
     logger.info("Stripe price→tier map loaded (%d entries)", len(STRIPE_PRICE_TO_TIER))
+    # Warm the limits cache and log what's actually in force, so a missing
+    # table or a bad row in cheri_ai_tier_limits is obvious in the deploy log
+    # rather than surfacing later as a surprising quota.
+    try:
+        logger.info("Cheri AI monthly limits: %s", describe_limits(await get_monthly_limits()))
+    except Exception as e:
+        logger.warning("Could not load tier limits at startup (%r); using env/defaults", e)
     yield
     logger.info("CheriPic AI Backend shutting down...")
 
@@ -226,18 +240,32 @@ async def chat(
 
     # ---- Membership rate limit (BEFORE the LLM call so we don't burn $$) ----
     tier = await billing.get_membership_tier(user_id)
-    limit = CHERI_AI_DAILY_LIMITS.get(tier, CHERI_AI_DAILY_LIMITS["basic"])
-    used = await billing.get_daily_usage(user_id)
+    limits = await get_monthly_limits()
+    limit = limits.get(tier, limits["basic"])
+    period = await billing.get_quota_period(user_id)
+    used = await billing.get_period_usage(user_id, period["period_start"])
     if math.isfinite(limit) and used >= limit:
+        resets = (
+            "when your plan renews"
+            if period["source"] == "billing_cycle"
+            else "at the start of next month (UTC)"
+        )
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
-                "error": "cheri_ai_daily_limit_reached",
+                "error": "cheri_ai_monthly_limit_reached",
                 "message": (
-                    f"You've used your {int(limit)} Cheri messages for today. "
-                    "Upgrade your plan for more — they reset at midnight UTC."
+                    f"You've used all {int(limit)} of your Cheri messages for "
+                    f"this period. Upgrade your plan for more — they reset "
+                    f"{resets}."
                 ),
                 "tier": tier,
+                "monthly_used": used,
+                "monthly_limit": int(limit),
+                "period_start": period["period_start"],
+                "period_end": period["period_end"],
+                # Deprecated aliases — kept so the current frontend keeps
+                # rendering while it migrates to the monthly_* fields.
                 "daily_used": used,
                 "daily_limit": int(limit),
             },
@@ -316,9 +344,9 @@ async def chat(
             f"(background_tasks queue = {len(background_tasks.tasks)})"
         )
 
-        # Bump the daily counter only AFTER a successful LLM call so failed
+        # Bump the period counter only AFTER a successful LLM call so failed
         # requests don't eat into the user's quota.
-        new_used = await billing.increment_daily_usage(user_id)
+        new_used = await billing.increment_period_usage(user_id, period["period_start"])
 
         return ChatResponse(
             reply=reply_text,
@@ -327,6 +355,10 @@ async def chat(
             stage=req.stage,
             timestamp=datetime.now().isoformat(),
             tier=tier,
+            monthly_used=new_used,
+            monthly_limit=None if math.isinf(limit) else int(limit),
+            period_start=period["period_start"],
+            period_end=period["period_end"],
             daily_used=new_used,
             daily_limit=None if math.isinf(limit) else int(limit),
         )
@@ -621,7 +653,7 @@ async def stripe_webhook(request: Request):
 @app.get("/billing/me/{user_id}", tags=["Billing"])
 async def get_my_membership(user_id: str, authed: str = Depends(get_current_user_id)):
     """
-    Returns the user's active membership tier + today's Cheri usage.
+    Returns the user's active membership tier + this period's Cheri usage.
     Wrapped in defensive try/except so an upstream Supabase outage (missing
     table, expired key, transient network) returns a safe default instead
     of a 500 — the frontend's Home + Profile both hit this on every load
@@ -635,17 +667,27 @@ async def get_my_membership(user_id: str, authed: str = Depends(get_current_user
         tier = "basic"
 
     try:
-        used = await billing.get_daily_usage(user_id)
+        period = await billing.get_quota_period(user_id)
+        used = await billing.get_period_usage(user_id, period["period_start"])
     except Exception as e:
-        logger.warning("get_daily_usage failed for %s: %r", user_id, e)
+        logger.warning("period usage lookup failed for %s: %r", user_id, e)
+        period = {"period_start": None, "period_end": None, "source": "calendar_month"}
         used = 0
 
-    limit = CHERI_AI_DAILY_LIMITS.get(tier, CHERI_AI_DAILY_LIMITS["basic"])
+    limits = await get_monthly_limits()
+    limit = limits.get(tier, limits["basic"])
+    capped = None if math.isinf(limit) else int(limit)
     return {
         "tier": tier,
         "cheri_ai": {
+            "monthly_used": used,
+            "monthly_limit": capped,
+            "period_start": period["period_start"],
+            "period_end": period["period_end"],
+            "resets_on": period["source"],  # billing_cycle | calendar_month
+            # Deprecated aliases — see ChatResponse.
             "daily_used": used,
-            "daily_limit": None if math.isinf(limit) else int(limit),
+            "daily_limit": capped,
         },
     }
 
