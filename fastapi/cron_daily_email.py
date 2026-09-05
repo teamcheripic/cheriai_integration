@@ -242,18 +242,15 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
 # --- Email rendering + send -----------------------------------------------
 def _summarize_lines(n_match: int, n_interest: int) -> tuple[str, str]:
     """
-    Return (headline_short, headline_long) — the short form is for subject
-    lines / preview text, the long form is the body sentence.
+    Return (headline_short, headline_long) — generic wording that reads
+    well for any count. Specific counts are still exposed to templates as
+    {{matches_count}} / {{interests_count}} for admins who want a
+    data-heavy variant, but the default headlines stay evergreen so one
+    template covers "one new match" through "ten interests waiting"
+    equally well.
     """
-    if n_interest and n_match:
-        short = f"{n_interest} interest{'s' if n_interest > 1 else ''} + {n_match} new match{'es' if n_match > 1 else ''}"
-        long = f"{n_interest} interest{'s' if n_interest > 1 else ''} waiting for your reply, plus {n_match} new match suggestion{'s' if n_match > 1 else ''}."
-    elif n_interest:
-        short = f"{n_interest} {'people' if n_interest > 1 else 'someone'} interested in you"
-        long = f"You have {n_interest} pending interest{'s' if n_interest > 1 else ''} waiting for your reply."
-    else:
-        short = f"{n_match} new match suggestion{'s' if n_match > 1 else ''}"
-        long = f"CheriAI surfaced {n_match} new profile{'s' if n_match > 1 else ''} we think you'll like."
+    short = "New matches waiting"
+    long = "Someone new is waiting to meet you on CheriPic."
     return short, long
 
 
@@ -326,17 +323,32 @@ async def _build_render_context(
 
 
 def _fallback_html(ctx: dict[str, Any]) -> str:
-    """Used when email_templates row is missing. Same structure as the seed."""
+    """
+    Used when email_templates row is missing. Matches the brand palette in
+    tailwind.config.cjs — black backgrounds, brand-purple accents — so the
+    fallback still looks on-brand even without the DB template.
+    """
+    logo_img = (
+        f"<img src=\"{ctx['logo_url']}\" alt=\"CheriPic\" width=\"120\" style=\"display:block;max-width:120px;height:auto;margin:0 auto;\" />"
+        if ctx.get("logo_url") else ""
+    )
     return (
-        f"<div style=\"font-family:'Helvetica Neue',Arial,sans-serif; max-width:520px; margin:auto; color:#1a0420; padding:24px;\">"
-        f"<h2 style=\"margin:0 0 12px;\">Hey {ctx['name']},</h2>"
-        f"<p style=\"font-size:15px; line-height:1.55;\">{ctx['headline']}</p>"
-        f"<p style=\"margin:24px 0;\">"
+        f"<div style=\"background:#0a0a0f; padding:32px 12px; font-family:'Helvetica Neue',Arial,sans-serif;\">"
+        f"<div style=\"max-width:560px; margin:0 auto; background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 10px 40px rgba(108,71,255,0.20);\">"
+        f"<div style=\"padding:32px 32px 24px; background:#0a0a0f; text-align:center;\">{logo_img}</div>"
+        f"<div style=\"padding:32px 36px 8px; color:#0a0a0f;\">"
+        f"<h1 style=\"margin:0 0 14px; font-size:24px; font-weight:800;\">Hey {ctx['name']} 👋</h1>"
+        f"<p style=\"margin:0 0 24px; font-size:15px; line-height:1.65; color:#3d3d47;\">{ctx['headline']}</p>"
+        f"</div>"
+        f"<div style=\"padding:4px 36px 32px; text-align:center;\">"
         f"<a href=\"{ctx['app_url']}/#/matching\" "
-        f"style=\"background:linear-gradient(135deg,#ec4899,#a855f7); color:#fff; text-decoration:none; padding:12px 22px; border-radius:12px; font-weight:700;\">"
-        f"Open CheriPic →</a></p>"
-        f"<p style=\"font-size:12px; color:#6b7280; margin-top:32px;\">"
-        f"<a href=\"{ctx['unsubscribe_url']}\" style=\"color:#6b7280;\">Manage notifications</a></p>"
+        f"style=\"display:inline-block; padding:16px 34px; color:#fff; text-decoration:none; font-weight:700; border-radius:14px; background:linear-gradient(135deg,#6c47ff 0%,#8a60ff 100%);\">Open CheriPic →</a>"
+        f"</div>"
+        f"<div style=\"padding:22px 36px 26px; background:#0a0a0f; text-align:center; color:#8a8a94; font-size:12px; line-height:1.7;\">"
+        f"Need help? <a href=\"mailto:{ctx['support_email']}\" style=\"color:#8a60ff; text-decoration:none;\">{ctx['support_email']}</a><br />"
+        f"<a href=\"{ctx['unsubscribe_url']}\" style=\"color:#6a6a72;\">Manage notifications</a>"
+        f"</div>"
+        f"</div>"
         f"</div>"
     )
 
