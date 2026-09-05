@@ -81,6 +81,31 @@ async def _cfg_min_age_hours() -> int:
 async def _cfg_max_per_run() -> int:
     return await get_int("email_nudge_max_per_run", env_key="EMAIL_NUDGE_MAX_PER_RUN", default=200)
 
+
+async def _cfg_support_email() -> str:
+    # Falls back to just the mailbox part of the from-address (strip the
+    # display name) so the footer contact line always has something valid.
+    val = await get_config("email_support_email", default=None)
+    if val:
+        return val
+    frm = await _cfg_from_address()
+    if "<" in frm and ">" in frm:
+        return frm.split("<", 1)[1].rstrip(">").strip()
+    return frm
+
+
+async def _cfg_logo_url() -> str:
+    return await get_config("email_logo_url", default="") or ""
+
+
+async def _cfg_unsubscribe_url() -> str:
+    """Where the footer 'manage / unsubscribe' link goes. Defaults to /#/profile."""
+    override = await get_config("email_unsubscribe_url", default=None)
+    if override:
+        return override
+    app_base = await _cfg_app_base_url()
+    return f"{app_base}/#/profile"
+
 # Master switch for the in-process APScheduler wiring in main.py. Off by
 # default so a first Railway deploy of this file cannot start sending mail
 # before the operator has set RESEND_API_KEY and reviewed the eligibility
@@ -215,58 +240,136 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
 
 
 # --- Email rendering + send -----------------------------------------------
-def _summarize(notifs: list[dict[str, Any]]) -> tuple[str, str]:
-    """Pick a subject + a short summary sentence based on what's waiting."""
+def _summarize_lines(n_match: int, n_interest: int) -> tuple[str, str]:
+    """
+    Return (headline_short, headline_long) — the short form is for subject
+    lines / preview text, the long form is the body sentence.
+    """
+    if n_interest and n_match:
+        short = f"{n_interest} interest{'s' if n_interest > 1 else ''} + {n_match} new match{'es' if n_match > 1 else ''}"
+        long = f"{n_interest} interest{'s' if n_interest > 1 else ''} waiting for your reply, plus {n_match} new match suggestion{'s' if n_match > 1 else ''}."
+    elif n_interest:
+        short = f"{n_interest} {'people' if n_interest > 1 else 'someone'} interested in you"
+        long = f"You have {n_interest} pending interest{'s' if n_interest > 1 else ''} waiting for your reply."
+    else:
+        short = f"{n_match} new match suggestion{'s' if n_match > 1 else ''}"
+        long = f"CheriAI surfaced {n_match} new profile{'s' if n_match > 1 else ''} we think you'll like."
+    return short, long
+
+
+async def _load_template(slug: str) -> dict[str, str] | None:
+    """
+    Fetch one row from email_templates. Returns None if the row is missing
+    or the DB call fails — callers fall back to the hardcoded default in
+    that case so a broken template never blocks sends.
+    """
+    try:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Accept": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/email_templates",
+                params={"select": "subject,html_body,text_body", "slug": f"eq.{slug}", "limit": "1"},
+                headers=headers,
+            )
+            resp.raise_for_status()
+            rows = resp.json() or []
+        return rows[0] if rows else None
+    except Exception as e:
+        logger.warning("email_templates load failed for slug=%s: %r", slug, e)
+        return None
+
+
+def _apply_template_vars(text: str, ctx: dict[str, Any]) -> str:
+    """Tiny {{key}} substitution engine. No conditionals, no escaping."""
+    out = text
+    for k, v in ctx.items():
+        out = out.replace("{{" + k + "}}", "" if v is None else str(v))
+    return out
+
+
+async def _build_render_context(
+    name: str,
+    notifs: list[dict[str, Any]],
+    *,
+    override_headline: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """
+    Shared substitution context for all match-nudge renders. Returns
+    (headline_short, ctx) so the caller can also use headline_short in
+    the subject line if the template references it.
+    """
     n_match = sum(1 for n in notifs if n["type"] == "match_available")
     n_interest = sum(1 for n in notifs if n["type"] == "interest_received")
 
-    if n_interest and n_match:
-        subject = f"{n_interest} {'people are' if n_interest > 1 else 'someone is'} interested — and new matches too ✨"
-        line = f"{n_interest} interest{'s' if n_interest > 1 else ''} waiting for your reply, plus {n_match} new match suggestion{'s' if n_match > 1 else ''}."
-    elif n_interest:
-        subject = f"{n_interest} {'people' if n_interest > 1 else 'someone'} interested in you on CheriPic 💌"
-        line = f"You have {n_interest} pending interest{'s' if n_interest > 1 else ''} waiting for your reply."
-    else:
-        subject = f"{n_match} new match suggestion{'s' if n_match > 1 else ''} on CheriPic ✨"
-        line = f"CheriAI surfaced {n_match} new profile{'s' if n_match > 1 else ''} we think you'll like."
-    return subject, line
+    default_headline_short, default_headline = _summarize_lines(n_match, n_interest)
+    headline = override_headline or default_headline
+
+    app_base = await _cfg_app_base_url()
+    ctx = {
+        "name": name,
+        "headline": headline,
+        "headline_short": default_headline_short,
+        "matches_count": n_match,
+        "interests_count": n_interest,
+        "matches_plural": "" if n_match == 1 else "s",
+        "interests_plural": "" if n_interest == 1 else "s",
+        "app_url": app_base,
+        "logo_url": await _cfg_logo_url(),
+        "support_email": await _cfg_support_email(),
+        "unsubscribe_url": await _cfg_unsubscribe_url(),
+    }
+    return default_headline_short, ctx
+
+
+def _fallback_html(ctx: dict[str, Any]) -> str:
+    """Used when email_templates row is missing. Same structure as the seed."""
+    return (
+        f"<div style=\"font-family:'Helvetica Neue',Arial,sans-serif; max-width:520px; margin:auto; color:#1a0420; padding:24px;\">"
+        f"<h2 style=\"margin:0 0 12px;\">Hey {ctx['name']},</h2>"
+        f"<p style=\"font-size:15px; line-height:1.55;\">{ctx['headline']}</p>"
+        f"<p style=\"margin:24px 0;\">"
+        f"<a href=\"{ctx['app_url']}/#/matching\" "
+        f"style=\"background:linear-gradient(135deg,#ec4899,#a855f7); color:#fff; text-decoration:none; padding:12px 22px; border-radius:12px; font-weight:700;\">"
+        f"Open CheriPic →</a></p>"
+        f"<p style=\"font-size:12px; color:#6b7280; margin-top:32px;\">"
+        f"<a href=\"{ctx['unsubscribe_url']}\" style=\"color:#6b7280;\">Manage notifications</a></p>"
+        f"</div>"
+    )
+
+
+def _fallback_text(ctx: dict[str, Any]) -> str:
+    return (
+        f"Hey {ctx['name']},\n\n"
+        f"{ctx['headline']}\n\n"
+        f"Open CheriPic: {ctx['app_url']}/#/matching\n\n"
+        f"Manage notifications: {ctx['unsubscribe_url']}\n"
+    )
 
 
 async def render_email(name: str, notifs: list[dict[str, Any]]) -> tuple[str, str, str]:
-    """Build (subject, html, text). Plain-text fallback improves deliverability."""
-    subject, headline = _summarize(notifs)
+    """
+    Build (subject, html, text) by loading the 'daily_match_nudge' template
+    from the DB and substituting variables. Falls back to a hardcoded
+    minimal template if the row is missing or the DB call fails, so a
+    broken template can NEVER block sends.
+    """
+    _, ctx = await _build_render_context(name, notifs)
+    template = await _load_template(CAMPAIGN)
 
-    app_base = await _cfg_app_base_url()
-    # Fair-use unsubscribe stub — for now it lands on the Profile page's
-    # notification settings section. Wire a real unsubscribe token when we go
-    # over ~1k emails/day (Gmail / Yahoo bulk-sender rule).
-    unsubscribe_url = f"{app_base}/#/profile"
+    if template:
+        subject = _apply_template_vars(template["subject"], ctx)
+        html = _apply_template_vars(template["html_body"], ctx)
+        text = _apply_template_vars(template["text_body"] or _fallback_text(ctx), ctx)
+    else:
+        logger.warning("email_templates row missing for %s — using hardcoded fallback.", CAMPAIGN)
+        subject = f"{ctx['headline_short']} on CheriPic"
+        html = _fallback_html(ctx)
+        text = _fallback_text(ctx)
 
-    html = f"""
-    <div style="font-family: 'Jost', system-ui, sans-serif; max-width: 480px; margin: auto; color: #1a0420; padding: 24px;">
-      <h2 style="margin: 0 0 12px;">Hey {name},</h2>
-      <p style="font-size: 15px; line-height: 1.55;">{headline}</p>
-      <p style="margin: 24px 0;">
-        <a href="{app_base}/#/matching"
-           style="background: linear-gradient(135deg, #ec4899, #a855f7);
-                  color: #fff; text-decoration: none; padding: 12px 22px;
-                  border-radius: 12px; font-weight: 700; letter-spacing: 0.3px;">
-          Open CheriPic →
-        </a>
-      </p>
-      <p style="font-size: 12px; color: #6b7280; margin-top: 32px;">
-        You're getting this because you turned on match notifications on CheriPic.
-        <a href="{unsubscribe_url}" style="color: #6b7280;">Manage notifications</a>.
-      </p>
-    </div>
-    """.strip()
-
-    text = (
-        f"Hey {name},\n\n"
-        f"{headline}\n\n"
-        f"Open CheriPic: {app_base}/#/matching\n\n"
-        f"Manage notifications: {unsubscribe_url}\n"
-    )
     return subject, html, text
 
 
@@ -304,48 +407,24 @@ async def send_email(
         return True, None
 
 
-def _render_test_email(to_address: str, app_base: str) -> tuple[str, str, str]:
-    """Canned content for the "test send" flow. Never touches sent_emails."""
-    subject = "CheriPic email test ✅"
-    html = f"""
-    <div style="font-family: 'Jost', system-ui, sans-serif; max-width: 480px; margin: auto; color: #1a0420; padding: 24px;">
-      <h2 style="margin: 0 0 12px;">Test email from CheriPic</h2>
-      <p style="font-size: 15px; line-height: 1.55;">
-        If you're reading this, the FastAPI backend on Railway can reach Resend
-        and the domain DNS is verified. Sent to <strong>{to_address}</strong>.
-      </p>
-      <p style="margin: 24px 0;">
-        <a href="{app_base}"
-           style="background: linear-gradient(135deg, #ec4899, #a855f7);
-                  color: #fff; text-decoration: none; padding: 12px 22px;
-                  border-radius: 12px; font-weight: 700; letter-spacing: 0.3px;">
-          Open CheriPic
-        </a>
-      </p>
-      <p style="font-size: 12px; color: #6b7280; margin-top: 32px;">
-        Sent from the admin panel's Email Campaigns → Test send button.
-      </p>
-    </div>
-    """.strip()
-    text = (
-        "Test email from CheriPic\n\n"
-        f"If you're reading this, the FastAPI backend on Railway can reach Resend "
-        f"and the domain DNS is verified.\nSent to {to_address}.\n\n"
-        f"Open CheriPic: {app_base}\n"
-    )
-    return subject, html, text
-
-
 async def send_test_email(to_address: str) -> dict[str, Any]:
     """
-    Send a single canned test email to `to_address`. Bypasses eligibility,
-    does NOT touch sent_emails, safe to fire repeatedly.
+    Send a single test email to `to_address` using the current DB template
+    with fake sample data (2 matches + 1 interest). Bypasses eligibility
+    and does NOT touch sent_emails / notifications, so it's safe to fire
+    repeatedly and gives the admin an accurate preview of the live layout
+    (logo, colours, button, unsubscribe link).
     """
     if not to_address or "@" not in to_address:
         return {"ok": False, "error": "invalid_address"}
 
-    app_base = await _cfg_app_base_url()
-    subject, html, text = _render_test_email(to_address, app_base)
+    fake_notifs = [
+        {"type": "match_available", "id": "test", "title": "", "body": ""},
+        {"type": "match_available", "id": "test2", "title": "", "body": ""},
+        {"type": "interest_received", "id": "test3", "title": "", "body": ""},
+    ]
+    subject, html, text = await render_email("there (test)", fake_notifs)
+
     async with httpx.AsyncClient() as client:
         ok, provider_id = await send_email(client, to_address, subject, html, text)
     return {
