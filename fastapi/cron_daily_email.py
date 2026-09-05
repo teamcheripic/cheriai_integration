@@ -407,23 +407,57 @@ async def send_email(
         return True, None
 
 
+_FAKE_TEST_NOTIFS = [
+    {"type": "match_available", "id": "test", "title": "", "body": ""},
+    {"type": "match_available", "id": "test2", "title": "", "body": ""},
+    {"type": "interest_received", "id": "test3", "title": "", "body": ""},
+]
+
+
 async def send_test_email(to_address: str) -> dict[str, Any]:
     """
-    Send a single test email to `to_address` using the current DB template
-    with fake sample data (2 matches + 1 interest). Bypasses eligibility
-    and does NOT touch sent_emails / notifications, so it's safe to fire
-    repeatedly and gives the admin an accurate preview of the live layout
-    (logo, colours, button, unsubscribe link).
+    Send a single test email to `to_address` using the current SAVED DB
+    template with fake sample data (2 matches + 1 interest). Bypasses
+    eligibility and does NOT touch sent_emails / notifications, so it's
+    safe to fire repeatedly and gives the admin an accurate preview of the
+    live layout (logo, colours, button, unsubscribe link).
     """
     if not to_address or "@" not in to_address:
         return {"ok": False, "error": "invalid_address"}
 
-    fake_notifs = [
-        {"type": "match_available", "id": "test", "title": "", "body": ""},
-        {"type": "match_available", "id": "test2", "title": "", "body": ""},
-        {"type": "interest_received", "id": "test3", "title": "", "body": ""},
-    ]
-    subject, html, text = await render_email("there (test)", fake_notifs)
+    subject, html, text = await render_email("there (test)", _FAKE_TEST_NOTIFS)
+
+    async with httpx.AsyncClient() as client:
+        ok, provider_id = await send_email(client, to_address, subject, html, text)
+    return {
+        "ok": ok,
+        "to": to_address,
+        "subject": subject,
+        "provider_id": provider_id,
+        "error": None if ok else "resend_call_failed_see_logs",
+    }
+
+
+async def send_template_test_email(
+    to_address: str,
+    subject_template: str,
+    html_template: str,
+    text_template: str,
+) -> dict[str, Any]:
+    """
+    Same as send_test_email but renders from the provided RAW templates
+    instead of the saved DB row. Lets an admin test an unsaved draft from
+    the Email Templates editor without committing it first.
+    """
+    if not to_address or "@" not in to_address:
+        return {"ok": False, "error": "invalid_address"}
+    if not subject_template or not html_template:
+        return {"ok": False, "error": "subject and html_body are required"}
+
+    _, ctx = await _build_render_context("there (test)", _FAKE_TEST_NOTIFS)
+    subject = _apply_template_vars(subject_template, ctx)
+    html = _apply_template_vars(html_template, ctx)
+    text = _apply_template_vars(text_template or _fallback_text(ctx), ctx)
 
     async with httpx.AsyncClient() as client:
         ok, provider_id = await send_email(client, to_address, subject, html, text)

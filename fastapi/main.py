@@ -42,7 +42,12 @@ from user_memory import (
 from face_verification import compare_faces, FaceServiceUnavailable
 from tier_limits import get_monthly_limits, STRIPE_PRICE_TO_TIER, describe_limits
 import billing
-from cron_daily_email import run_once as run_daily_email_cron, scheduler_enabled as daily_email_enabled, send_test_email
+from cron_daily_email import (
+    run_once as run_daily_email_cron,
+    scheduler_enabled as daily_email_enabled,
+    send_test_email,
+    send_template_test_email,
+)
 from app_config import invalidate_config_cache
 
 logging.basicConfig(
@@ -308,6 +313,47 @@ async def admin_send_test_email(
     # picked up on the very next click, not after the 60s TTL.
     invalidate_config_cache()
     return await send_test_email(req.to_address)
+
+
+class SendTestTemplateRequest(BaseModel):
+    to_address: str
+    subject: str
+    html_body: str
+    text_body: Optional[str] = ""
+
+    @validator("to_address")
+    def _valid_email(cls, v: str) -> str:
+        v = (v or "").strip()
+        if "@" not in v or len(v) < 3:
+            raise ValueError("to_address must be a valid email address")
+        return v
+
+    @validator("subject", "html_body")
+    def _not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("subject and html_body are required")
+        return v
+
+
+@app.post("/admin/send-test-template", tags=["Admin"])
+async def admin_send_test_template(
+    req: SendTestTemplateRequest,
+    admin_user_id: str = Depends(get_current_admin_id),
+):
+    """
+    Fire a test email rendered from the RAW subject/html/text in the body
+    — bypasses the saved template row, so an admin can preview an unsaved
+    draft from the Email Templates editor without committing it first.
+    Does NOT touch sent_emails or notifications.
+    """
+    logger.info("[test-template] admin=%s to=%s", admin_user_id, req.to_address)
+    invalidate_config_cache()
+    return await send_template_test_email(
+        to_address=req.to_address,
+        subject_template=req.subject,
+        html_template=req.html_body,
+        text_template=req.text_body or "",
+    )
 
 
 @app.post("/admin/invalidate-app-config-cache", tags=["Admin"])
