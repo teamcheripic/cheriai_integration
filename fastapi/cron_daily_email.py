@@ -249,8 +249,8 @@ def _summarize_lines(n_match: int, n_interest: int) -> tuple[str, str]:
     template covers "one new match" through "ten interests waiting"
     equally well.
     """
-    short = "New matches waiting"
-    long = "Someone new is waiting to meet you on CheriPic."
+    short = "A new potential connection"
+    long = "A new potential connection is waiting on CheriPic."
     return short, long
 
 
@@ -324,29 +324,42 @@ async def _build_render_context(
 
 def _fallback_html(ctx: dict[str, Any]) -> str:
     """
-    Used when email_templates row is missing. Matches the brand palette in
-    tailwind.config.cjs — black backgrounds, brand-purple accents — so the
-    fallback still looks on-brand even without the DB template.
+    Used when email_templates row is missing. Matches the v2 design in
+    migration 007 — deep-purple ground, logo on top, white card with a
+    purple headline, "Clarity before connection." tagline.
     """
     logo_img = (
-        f"<img src=\"{ctx['logo_url']}\" alt=\"CheriPic\" width=\"120\" style=\"display:block;max-width:120px;height:auto;margin:0 auto;\" />"
+        f"<img src=\"{ctx['logo_url']}\" alt=\"CheriPic\" width=\"150\" style=\"display:block;max-width:150px;height:auto;margin:0 auto;\" />"
         if ctx.get("logo_url") else ""
     )
     return (
-        f"<div style=\"background:#0a0a0f; padding:32px 12px; font-family:'Helvetica Neue',Arial,sans-serif;\">"
-        f"<div style=\"max-width:560px; margin:0 auto; background:#ffffff; border-radius:20px; overflow:hidden; box-shadow:0 10px 40px rgba(108,71,255,0.20);\">"
-        f"<div style=\"padding:32px 32px 24px; background:#0a0a0f; text-align:center;\">{logo_img}</div>"
-        f"<div style=\"padding:32px 36px 8px; color:#0a0a0f;\">"
-        f"<h1 style=\"margin:0 0 14px; font-size:24px; font-weight:800;\">Hey {ctx['name']} 👋</h1>"
-        f"<p style=\"margin:0 0 24px; font-size:15px; line-height:1.65; color:#3d3d47;\">{ctx['headline']}</p>"
+        f"<div style=\"background:#34205f; padding:36px 16px 28px; font-family:'Helvetica Neue',Arial,sans-serif;\">"
+        f"<div style=\"max-width:560px; margin:0 auto; text-align:center;\">"
+        # Logo
+        f"<div style=\"margin-bottom:20px;\">{logo_img}"
+        f"<div style=\"height:2px;width:56px;background:linear-gradient(90deg,#6c47ff,#8a60ff);border-radius:2px;margin:8px auto 0;\"></div>"
         f"</div>"
-        f"<div style=\"padding:4px 36px 32px; text-align:center;\">"
+        # White card
+        f"<div style=\"background:#ffffff;border-radius:22px;overflow:hidden;box-shadow:0 18px 60px rgba(10,10,15,0.35);text-align:left;\">"
+        f"<div style=\"padding:36px 40px 8px;color:#0a0a0f;\">"
+        f"<div style=\"font-size:16px;font-weight:800;color:#0a0a0f;\">Hey {ctx['name']} 👋</div>"
+        f"<h1 style=\"margin:18px 0 20px;font-size:26px;line-height:1.25;font-weight:800;color:#6c47ff;\">{ctx['headline']}</h1>"
+        f"<p style=\"margin:0 0 14px;font-size:15px;line-height:1.65;color:#3d3d47;\">Not just another profile — someone who may align with what matters to you.</p>"
+        f"<p style=\"margin:0 0 24px;font-size:15px;line-height:1.65;color:#3d3d47;\">Take a look before this connection moves on.</p>"
+        f"</div>"
+        f"<div style=\"padding:4px 40px 20px;text-align:center;\">"
         f"<a href=\"{ctx['app_url']}/#/matching\" "
-        f"style=\"display:inline-block; padding:16px 34px; color:#fff; text-decoration:none; font-weight:700; border-radius:14px; background:linear-gradient(135deg,#6c47ff 0%,#8a60ff 100%);\">Open CheriPic →</a>"
+        f"style=\"display:inline-block;padding:16px 40px;font-size:16px;color:#fff;text-decoration:none;font-weight:700;border-radius:14px;background:linear-gradient(135deg,#6c47ff 0%,#8a60ff 100%);\">See My Connection →</a>"
         f"</div>"
-        f"<div style=\"padding:22px 36px 26px; background:#0a0a0f; text-align:center; color:#8a8a94; font-size:12px; line-height:1.7;\">"
-        f"Need help? <a href=\"mailto:{ctx['support_email']}\" style=\"color:#8a60ff; text-decoration:none;\">{ctx['support_email']}</a><br />"
-        f"<a href=\"{ctx['unsubscribe_url']}\" style=\"color:#6a6a72;\">Manage notifications</a>"
+        f"<div style=\"padding:22px 40px 30px;text-align:center;font-size:14px;color:#3d3d47;line-height:1.6;\">"
+        f"With love,<br /><strong style=\"color:#6c47ff;font-size:15px;\">The CheriPic Team</strong>"
+        f"<div style=\"margin-top:8px;font-style:italic;color:#8a8a94;font-size:13px;\">Clarity before connection.</div>"
+        f"</div>"
+        f"</div>"
+        # Footer on purple ground
+        f"<div style=\"margin-top:22px;font-size:12px;color:#c4b5fd;line-height:1.75;\">"
+        f"Need help? <a href=\"mailto:{ctx['support_email']}\" style=\"color:#ffffff;text-decoration:none;font-weight:600;\">{ctx['support_email']}</a><br />"
+        f"<a href=\"{ctx['unsubscribe_url']}\" style=\"color:#c4b5fd;\">Manage notification preferences</a>"
         f"</div>"
         f"</div>"
         f"</div>"
@@ -450,6 +463,15 @@ async def send_test_email(to_address: str) -> dict[str, Any]:
     }
 
 
+# Extra sample values injected only into the test-send context so admins
+# can preview templates that carry variables no cron currently supplies
+# (e.g. {{otp_code}} on auth_otp). Real sends of those templates fill
+# these keys from their own call site (the auth flow for otp_code).
+_TEST_EXTRA_VARS: dict[str, Any] = {
+    "otp_code": "519247",
+}
+
+
 async def send_template_test_email(
     to_address: str,
     subject_template: str,
@@ -460,6 +482,10 @@ async def send_template_test_email(
     Same as send_test_email but renders from the provided RAW templates
     instead of the saved DB row. Lets an admin test an unsaved draft from
     the Email Templates editor without committing it first.
+
+    The render context is the standard cron context (name, headline, app
+    URL, logo, etc.) PLUS every key in _TEST_EXTRA_VARS so templates that
+    reference otp_code / future variables still preview correctly.
     """
     if not to_address or "@" not in to_address:
         return {"ok": False, "error": "invalid_address"}
@@ -467,6 +493,7 @@ async def send_template_test_email(
         return {"ok": False, "error": "subject and html_body are required"}
 
     _, ctx = await _build_render_context("there (test)", _FAKE_TEST_NOTIFS)
+    ctx = {**ctx, **_TEST_EXTRA_VARS}
     subject = _apply_template_vars(subject_template, ctx)
     html = _apply_template_vars(html_template, ctx)
     text = _apply_template_vars(text_template or _fallback_text(ctx), ctx)
