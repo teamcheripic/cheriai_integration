@@ -310,53 +310,24 @@ async def admin_send_test_email(
     return await send_test_email(req.to_address)
 
 
-class SetAppConfigRequest(BaseModel):
-    key: str
-    value: Optional[str] = None  # None clears the row and falls back to env
-
-    @validator("key")
-    def _valid_key(cls, v: str) -> str:
-        v = (v or "").strip()
-        if not v:
-            raise ValueError("key is required")
-        return v
-
-
-@app.post("/admin/app-config", tags=["Admin"])
-async def admin_set_app_config(
-    req: SetAppConfigRequest,
+@app.post("/admin/invalidate-app-config-cache", tags=["Admin"])
+async def admin_invalidate_app_config_cache(
     admin_user_id: str = Depends(get_current_admin_id),
 ):
     """
-    Write one app_config row via the SECURITY DEFINER RPC. Backing store
-    is public.app_config (see migration 004). Invalidates the in-process
-    cache so the next read reflects the new value instantly.
+    Clear the in-process app_config cache so the next read hits the DB.
+    Called by the admin panel right after it writes a config value via
+    admin_set_app_config, so the change takes effect on the very next
+    backend request instead of waiting up to 60s for the TTL.
+
+    The write itself goes DIRECT from the browser to Supabase (through the
+    admin's own JWT) because the RPC's is_admin() check depends on
+    auth.uid() — routing the write via the service-role backend would
+    bypass user identity and 42501.
     """
-    logger.info("[app-config] admin=%s key=%s", admin_user_id, req.key)
-    try:
-        # RPC call via the same PostgREST wrapper the cron uses.
-        from supabase_client import SUPABASE_KEY, SUPABASE_URL
-        import httpx
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-        }
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(
-                f"{SUPABASE_URL}/rest/v1/rpc/admin_set_app_config",
-                json={"p_key": req.key, "p_value": req.value},
-                headers=headers,
-            )
-        if resp.status_code >= 300:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        invalidate_config_cache()
-        return resp.json()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("app-config write failed: %r", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    logger.info("[app-config-cache] invalidated by admin=%s", admin_user_id)
+    invalidate_config_cache()
+    return {"ok": True}
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
