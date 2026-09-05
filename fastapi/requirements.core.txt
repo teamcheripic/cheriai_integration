@@ -67,3 +67,8 @@ stripe>=11.0
 # Used by passenger_wsgi.py to wrap `app` from main.py. Harmless on Render
 # /VPS deploys where uvicorn talks to the ASGI app directly.
 a2wsgi>=1.10
+
+# APScheduler drives the in-process daily-email cron on Railway (see
+# cron_daily_email.py + lifespan handler in main.py). Pure-Python, no deps
+# beyond tzlocal — installs cleanly on cPanel too.
+apscheduler>=3.10,<4

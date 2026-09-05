@@ -42,6 +42,7 @@ from user_memory import (
 from face_verification import compare_faces, FaceServiceUnavailable
 from tier_limits import get_monthly_limits, STRIPE_PRICE_TO_TIER, describe_limits
 import billing
+from cron_daily_email import run_once as run_daily_email_cron, scheduler_enabled as daily_email_enabled
 
 logging.basicConfig(
     level=logging.INFO,
@@ -191,7 +192,43 @@ async def lifespan(app: FastAPI):
         logger.info("Cheri AI monthly limits: %s", describe_limits(await get_monthly_limits()))
     except Exception as e:
         logger.warning("Could not load tier limits at startup (%r); using env/defaults", e)
+
+    # ---- In-process scheduler for the daily match-nudge email --------------
+    # Railway hobby plans don't ship a first-class cron for single-container
+    # apps. Since the FastAPI process is always-on anyway, APScheduler ticks
+    # cheaply alongside it. Guarded by ENABLE_DAILY_EMAIL_CRON so setting up
+    # RESEND_API_KEY doesn't accidentally start a live blast.
+    app.state.scheduler = None
+    if daily_email_enabled():
+        try:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+            from apscheduler.triggers.cron import CronTrigger
+
+            # UTC-anchored so the job doesn't drift on DST-observing hosts.
+            # 08:30 UTC = 14:00 IST, which is a reasonable weekday-afternoon
+            # inbox nudge for the current user base.
+            cron_expr = os.getenv("DAILY_EMAIL_CRON", "30 8 * * *")
+            scheduler = AsyncIOScheduler(timezone="UTC")
+            scheduler.add_job(
+                run_daily_email_cron,
+                CronTrigger.from_crontab(cron_expr, timezone="UTC"),
+                id="daily_match_nudge",
+                max_instances=1,
+                coalesce=True,      # missed run while worker was down → run once, not N times
+                misfire_grace_time=3600,
+            )
+            scheduler.start()
+            app.state.scheduler = scheduler
+            logger.info("Daily email cron scheduled (UTC cron: '%s')", cron_expr)
+        except Exception as e:
+            logger.error("Could not start daily email scheduler: %r", e, exc_info=True)
+    else:
+        logger.info("Daily email cron is DISABLED (set ENABLE_DAILY_EMAIL_CRON=true to enable).")
+
     yield
+    if getattr(app.state, "scheduler", None):
+        app.state.scheduler.shutdown(wait=False)
+        logger.info("Daily email scheduler stopped.")
     logger.info("CheriPic AI Backend shutting down...")
 
 
@@ -227,6 +264,21 @@ async def health():
         "service": "CheriPic AI Backend",
         "timestamp": datetime.now().isoformat()
     }
+
+
+@app.post("/admin/run-daily-email-cron", tags=["Admin"])
+async def run_daily_email_now(
+    dry_run: bool = False,
+    admin_user_id: str = Depends(get_current_admin_id),
+):
+    """
+    Admin-only manual trigger for the match-nudge cron. Useful for verifying
+    the eligibility query + Resend config from the admin panel without
+    waiting for the scheduled 08:30 UTC run. `dry_run=true` returns who
+    WOULD be emailed and sends nothing.
+    """
+    logger.info("[cron-manual] admin=%s dry_run=%s", admin_user_id, dry_run)
+    return await run_daily_email_cron(dry_run=dry_run)
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])

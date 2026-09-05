@@ -52,7 +52,7 @@ services:
       - key: FRONTEND_URLS
         # ALL production origins, comma-separated, no spaces. Add every
         # domain your PWA is served from.
-        value: "https://arkxpert.com,https://www.arkxpert.com"
+        value: "https://cheripic.com,https://www.cheripic.com"
       - key: PORT
         value: "8000"
 
@@ -79,4 +79,4 @@ services:
       - key: RESEND_API_KEY
         sync: false
       - key: APP_BASE_URL
-        value: "https://arkxpert.com"
+        value: "https://cheripic.com"
