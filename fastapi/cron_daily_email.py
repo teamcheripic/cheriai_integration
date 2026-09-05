@@ -38,6 +38,7 @@ from typing import Any
 import httpx
 
 from supabase_client import SUPABASE_KEY, SUPABASE_URL
+from app_config import get_config, get_int
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,9 +47,10 @@ logging.basicConfig(
 logger = logging.getLogger("cron_daily_email")
 
 # --- Configuration ---------------------------------------------------------
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-FROM_ADDRESS = os.getenv("RESEND_FROM", "CheriPic <noreply@cheripic.com>")
-APP_BASE_URL = os.getenv("APP_BASE_URL", "https://cheripic.com")
+# All runtime-tunable values below are pulled from public.app_config via
+# app_config.get_config() at call time (60s cache + env fallback). That
+# means an admin rotating RESEND_API_KEY in the panel takes effect within
+# a minute — no Railway redeploy. See app_config.py + migration 004.
 RESEND_ENDPOINT = "https://api.resend.com/emails"
 
 # Which notification types trigger a nudge email. Kept small on purpose:
@@ -56,17 +58,28 @@ RESEND_ENDPOINT = "https://api.resend.com/emails"
 # interest_received = someone tapped Interested on the user
 NUDGEABLE_TYPES = ("match_available", "interest_received")
 
-# How long a notification must sit unread before we email about it. Gives the
-# in-app push a fair chance first and keeps the email a "you missed this"
-# rather than a duplicate.
-NOTIFICATION_MIN_AGE_HOURS = int(os.getenv("EMAIL_NUDGE_MIN_AGE_HOURS", "6"))
-
-# Hard cap per run so a first prod run over a large backlog doesn't burn the
-# Resend free tier in one shot.
-MAX_SENDS_PER_RUN = int(os.getenv("EMAIL_NUDGE_MAX_PER_RUN", "200"))
-
 # Campaign id — matches the sent_emails.campaign column and the unique index.
 CAMPAIGN = "daily_match_nudge"
+
+
+async def _cfg_resend_api_key() -> str:
+    return await get_config("resend_api_key", env_key="RESEND_API_KEY", default="") or ""
+
+
+async def _cfg_from_address() -> str:
+    return await get_config("resend_from", env_key="RESEND_FROM", default="CheriPic <noreply@cheripic.com>") or ""
+
+
+async def _cfg_app_base_url() -> str:
+    return await get_config("app_base_url", env_key="APP_BASE_URL", default="https://cheripic.com") or ""
+
+
+async def _cfg_min_age_hours() -> int:
+    return await get_int("email_nudge_min_age_hours", env_key="EMAIL_NUDGE_MIN_AGE_HOURS", default=6)
+
+
+async def _cfg_max_per_run() -> int:
+    return await get_int("email_nudge_max_per_run", env_key="EMAIL_NUDGE_MAX_PER_RUN", default=200)
 
 # Master switch for the in-process APScheduler wiring in main.py. Off by
 # default so a first Railway deploy of this file cannot start sending mail
@@ -116,7 +129,9 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
           ...
         ]
     """
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=NOTIFICATION_MIN_AGE_HOURS)).isoformat()
+    min_age_hours = await _cfg_min_age_hours()
+    max_per_run = await _cfg_max_per_run()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=min_age_hours)).isoformat()
 
     # 1. Pull unread nudgeable notifications, oldest first (so the summary
     #    email covers the earliest missed match first).
@@ -130,8 +145,8 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
             "read_at": "is.null",
             "created_at": f"lt.{cutoff}",
             "order": "created_at.asc",
-            # Over-fetch so grouping-by-user still yields ~MAX_SENDS_PER_RUN users
-            "limit": str(MAX_SENDS_PER_RUN * 4),
+            # Over-fetch so grouping-by-user still yields ~max_per_run users
+            "limit": str(max_per_run * 4),
         },
     )
     if not notifs:
@@ -196,7 +211,7 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
         )
         bucket["notifications"].append(n)
 
-    return list(by_user.values())[:MAX_SENDS_PER_RUN]
+    return list(by_user.values())[:max_per_run]
 
 
 # --- Email rendering + send -----------------------------------------------
@@ -217,21 +232,22 @@ def _summarize(notifs: list[dict[str, Any]]) -> tuple[str, str]:
     return subject, line
 
 
-def render_email(name: str, notifs: list[dict[str, Any]]) -> tuple[str, str, str]:
+async def render_email(name: str, notifs: list[dict[str, Any]]) -> tuple[str, str, str]:
     """Build (subject, html, text). Plain-text fallback improves deliverability."""
     subject, headline = _summarize(notifs)
 
+    app_base = await _cfg_app_base_url()
     # Fair-use unsubscribe stub — for now it lands on the Profile page's
     # notification settings section. Wire a real unsubscribe token when we go
     # over ~1k emails/day (Gmail / Yahoo bulk-sender rule).
-    unsubscribe_url = f"{APP_BASE_URL}/#/profile"
+    unsubscribe_url = f"{app_base}/#/profile"
 
     html = f"""
     <div style="font-family: 'Jost', system-ui, sans-serif; max-width: 480px; margin: auto; color: #1a0420; padding: 24px;">
       <h2 style="margin: 0 0 12px;">Hey {name},</h2>
       <p style="font-size: 15px; line-height: 1.55;">{headline}</p>
       <p style="margin: 24px 0;">
-        <a href="{APP_BASE_URL}/#/matching"
+        <a href="{app_base}/#/matching"
            style="background: linear-gradient(135deg, #ec4899, #a855f7);
                   color: #fff; text-decoration: none; padding: 12px 22px;
                   border-radius: 12px; font-weight: 700; letter-spacing: 0.3px;">
@@ -248,7 +264,7 @@ def render_email(name: str, notifs: list[dict[str, Any]]) -> tuple[str, str, str
     text = (
         f"Hey {name},\n\n"
         f"{headline}\n\n"
-        f"Open CheriPic: {APP_BASE_URL}/#/matching\n\n"
+        f"Open CheriPic: {app_base}/#/matching\n\n"
         f"Manage notifications: {unsubscribe_url}\n"
     )
     return subject, html, text
@@ -258,14 +274,20 @@ async def send_email(
     client: httpx.AsyncClient, to: str, subject: str, html: str, text: str
 ) -> tuple[bool, str | None]:
     """Fire one Resend send. Returns (ok, provider_message_id_or_None)."""
+    api_key = await _cfg_resend_api_key()
+    from_address = await _cfg_from_address()
+    if not api_key:
+        logger.error("Resend api key not configured (app_config.resend_api_key + RESEND_API_KEY env are both empty).")
+        return False, None
+
     res = await client.post(
         RESEND_ENDPOINT,
         headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
         json={
-            "from": FROM_ADDRESS,
+            "from": from_address,
             "to": [to],
             "subject": subject,
             "html": html,
@@ -282,25 +304,82 @@ async def send_email(
         return True, None
 
 
+def _render_test_email(to_address: str, app_base: str) -> tuple[str, str, str]:
+    """Canned content for the "test send" flow. Never touches sent_emails."""
+    subject = "CheriPic email test ✅"
+    html = f"""
+    <div style="font-family: 'Jost', system-ui, sans-serif; max-width: 480px; margin: auto; color: #1a0420; padding: 24px;">
+      <h2 style="margin: 0 0 12px;">Test email from CheriPic</h2>
+      <p style="font-size: 15px; line-height: 1.55;">
+        If you're reading this, the FastAPI backend on Railway can reach Resend
+        and the domain DNS is verified. Sent to <strong>{to_address}</strong>.
+      </p>
+      <p style="margin: 24px 0;">
+        <a href="{app_base}"
+           style="background: linear-gradient(135deg, #ec4899, #a855f7);
+                  color: #fff; text-decoration: none; padding: 12px 22px;
+                  border-radius: 12px; font-weight: 700; letter-spacing: 0.3px;">
+          Open CheriPic
+        </a>
+      </p>
+      <p style="font-size: 12px; color: #6b7280; margin-top: 32px;">
+        Sent from the admin panel's Email Campaigns → Test send button.
+      </p>
+    </div>
+    """.strip()
+    text = (
+        "Test email from CheriPic\n\n"
+        f"If you're reading this, the FastAPI backend on Railway can reach Resend "
+        f"and the domain DNS is verified.\nSent to {to_address}.\n\n"
+        f"Open CheriPic: {app_base}\n"
+    )
+    return subject, html, text
+
+
+async def send_test_email(to_address: str) -> dict[str, Any]:
+    """
+    Send a single canned test email to `to_address`. Bypasses eligibility,
+    does NOT touch sent_emails, safe to fire repeatedly.
+    """
+    if not to_address or "@" not in to_address:
+        return {"ok": False, "error": "invalid_address"}
+
+    app_base = await _cfg_app_base_url()
+    subject, html, text = _render_test_email(to_address, app_base)
+    async with httpx.AsyncClient() as client:
+        ok, provider_id = await send_email(client, to_address, subject, html, text)
+    return {
+        "ok": ok,
+        "to": to_address,
+        "subject": subject,
+        "provider_id": provider_id,
+        "error": None if ok else "resend_call_failed_see_logs",
+    }
+
+
 # --- Orchestration --------------------------------------------------------
 async def run_once(dry_run: bool = False) -> dict[str, int]:
     """One full cron pass. Returns counts so the caller/scheduler can log."""
-    if not RESEND_API_KEY and not dry_run:
-        logger.error("RESEND_API_KEY is not set — aborting cron run.")
+    api_key = await _cfg_resend_api_key()
+    if not api_key and not dry_run:
+        logger.error("Resend api key not configured — aborting cron run.")
         return {"sent": 0, "failed": 0, "skipped": 0, "eligible": 0}
+
+    min_age_hours = await _cfg_min_age_hours()
+    max_per_run = await _cfg_max_per_run()
 
     async with httpx.AsyncClient() as client:
         candidates = await gather_candidates(client)
         logger.info(
             "Eligible recipients: %d (min notification age %dh, cap %d/run)",
-            len(candidates), NOTIFICATION_MIN_AGE_HOURS, MAX_SENDS_PER_RUN,
+            len(candidates), min_age_hours, max_per_run,
         )
         if not candidates:
             return {"sent": 0, "failed": 0, "skipped": 0, "eligible": 0}
 
         sent = failed = 0
         for c in candidates:
-            subject, html, text = render_email(c["nick_name"], c["notifications"])
+            subject, html, text = await render_email(c["nick_name"], c["notifications"])
             if dry_run:
                 logger.info("[dry-run] %-30s | %d notif → %s", c["email"], len(c["notifications"]), subject)
                 sent += 1

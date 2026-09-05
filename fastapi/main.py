@@ -42,7 +42,8 @@ from user_memory import (
 from face_verification import compare_faces, FaceServiceUnavailable
 from tier_limits import get_monthly_limits, STRIPE_PRICE_TO_TIER, describe_limits
 import billing
-from cron_daily_email import run_once as run_daily_email_cron, scheduler_enabled as daily_email_enabled
+from cron_daily_email import run_once as run_daily_email_cron, scheduler_enabled as daily_email_enabled, send_test_email
+from app_config import invalidate_config_cache
 
 logging.basicConfig(
     level=logging.INFO,
@@ -279,6 +280,83 @@ async def run_daily_email_now(
     """
     logger.info("[cron-manual] admin=%s dry_run=%s", admin_user_id, dry_run)
     return await run_daily_email_cron(dry_run=dry_run)
+
+
+class SendTestEmailRequest(BaseModel):
+    to_address: str
+
+    @validator("to_address")
+    def _valid_email(cls, v: str) -> str:
+        v = (v or "").strip()
+        if "@" not in v or len(v) < 3:
+            raise ValueError("to_address must be a valid email address")
+        return v
+
+
+@app.post("/admin/send-test-email", tags=["Admin"])
+async def admin_send_test_email(
+    req: SendTestEmailRequest,
+    admin_user_id: str = Depends(get_current_admin_id),
+):
+    """
+    Fire a single canned test email through Resend. Does NOT touch
+    sent_emails or notifications — safe to repeat. Used by the admin panel's
+    Email Campaigns page.
+    """
+    logger.info("[test-email] admin=%s to=%s", admin_user_id, req.to_address)
+    # Cache-bust so an api key that was just rotated in the admin panel is
+    # picked up on the very next click, not after the 60s TTL.
+    invalidate_config_cache()
+    return await send_test_email(req.to_address)
+
+
+class SetAppConfigRequest(BaseModel):
+    key: str
+    value: Optional[str] = None  # None clears the row and falls back to env
+
+    @validator("key")
+    def _valid_key(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("key is required")
+        return v
+
+
+@app.post("/admin/app-config", tags=["Admin"])
+async def admin_set_app_config(
+    req: SetAppConfigRequest,
+    admin_user_id: str = Depends(get_current_admin_id),
+):
+    """
+    Write one app_config row via the SECURITY DEFINER RPC. Backing store
+    is public.app_config (see migration 004). Invalidates the in-process
+    cache so the next read reflects the new value instantly.
+    """
+    logger.info("[app-config] admin=%s key=%s", admin_user_id, req.key)
+    try:
+        # RPC call via the same PostgREST wrapper the cron uses.
+        from supabase_client import SUPABASE_KEY, SUPABASE_URL
+        import httpx
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/admin_set_app_config",
+                json={"p_key": req.key, "p_value": req.value},
+                headers=headers,
+            )
+        if resp.status_code >= 300:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        invalidate_config_cache()
+        return resp.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("app-config write failed: %r", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
