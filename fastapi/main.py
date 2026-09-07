@@ -56,6 +56,7 @@ from auth_email_hook import (
     parse_payload,
     verify_signature,
 )
+from canned_responses import classify as classify_canned, respond as respond_canned
 
 logging.basicConfig(
     level=logging.INFO,
@@ -471,6 +472,53 @@ async def chat(
 ):
     # user_id comes from the VERIFIED token — never from the request body.
     logger.info(f"Chat | User: {user_id} | Stage: {req.stage} | Length: {len(req.message)}")
+
+    # ---- Cheap intent router ------------------------------------------------
+    # If the message is an obvious pleasantry (hi / thanks / how are you /
+    # who are you / etc.) we short-circuit here with a canned Cheri-voice
+    # reply. Zero OpenAI tokens, zero quota consumed, still saved to
+    # chat_history so the conversation flows naturally, memory distillation
+    # is deliberately SKIPPED because these turns carry no signal.
+    canned_category = classify_canned(req.message)
+    if canned_category:
+        logger.info(f"[canned] category={canned_category} user={user_id}")
+        user_data = await fetch_user_profile(user_id) or {}
+        display_name = user_data.get("nick_name") or user_data.get("full_name")
+        reply_text, follow_up = respond_canned(canned_category, name=display_name)
+        conversation_id = req.conversation_id or f"conv_{user_id}_{int(datetime.now().timestamp())}"
+
+        try:
+            await save_conversation_message(user_id, conversation_id, "user", req.message, req.stage)
+            await save_conversation_message(user_id, conversation_id, "assistant", reply_text, req.stage)
+            if follow_up:
+                await save_conversation_message(user_id, conversation_id, "assistant", follow_up, req.stage)
+        except Exception as e:
+            logger.error(f"[canned chat_history] insert FAILED for user {user_id}: {e}")
+
+        # Tier / period is still surfaced so the frontend usage strip
+        # renders the same numbers as it would after an LLM reply. Cheap
+        # queries — no OpenAI involvement.
+        tier = await billing.get_membership_tier(user_id)
+        limits = await get_monthly_limits()
+        limit = limits.get(tier, limits["basic"])
+        period = await billing.get_quota_period(user_id)
+        used = await billing.get_period_usage(user_id, period["period_start"])
+        capped = None if math.isinf(limit) else int(limit)
+
+        return ChatResponse(
+            reply=reply_text,
+            follow_up=follow_up,
+            conversation_id=conversation_id,
+            stage=req.stage,
+            timestamp=datetime.now().isoformat(),
+            tier=tier,
+            monthly_used=used,
+            monthly_limit=capped,
+            period_start=period["period_start"],
+            period_end=period["period_end"],
+            daily_used=used,
+            daily_limit=capped,
+        )
 
     # ---- Membership rate limit (BEFORE the LLM call so we don't burn $$) ----
     tier = await billing.get_membership_tier(user_id)
