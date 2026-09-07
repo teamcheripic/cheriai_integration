@@ -49,6 +49,13 @@ from cron_daily_email import (
     send_template_test_email,
 )
 from app_config import invalidate_config_cache
+from auth_email_hook import (
+    HookVerificationError,
+    get_hook_secret,
+    handle_send_email,
+    parse_payload,
+    verify_signature,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -354,6 +361,86 @@ async def admin_send_test_template(
         html_template=req.html_body,
         text_template=req.text_body or "",
     )
+
+
+@app.post("/auth/send-email-hook", tags=["Auth"])
+async def supabase_send_email_hook(request: Request):
+    """
+    Supabase Auth "Send Email Hook" receiver.
+
+    Configure the URL + shared secret in Supabase Dashboard →
+    Authentication → Hooks → Send Email Hook. Every outbound auth email
+    (OTP, magic link, signup confirmation, recovery, invite, etc.) POSTs
+    here instead of being sent by Supabase directly — we render our
+    admin-editable template from public.email_templates and deliver it
+    through Resend.
+
+    Returns 200 on successful delivery. Anything else tells Supabase the
+    email failed so its auth flow surfaces the error to the caller.
+    """
+    body = await request.body()
+    headers = {k: v for k, v in request.headers.items()}
+
+    secret = await get_hook_secret()
+    if not secret:
+        logger.error("[auth-hook] send_email_hook_secret is not configured — refusing request")
+        raise HTTPException(status_code=500, detail="hook secret not configured")
+
+    try:
+        verify_signature(headers, body, secret)
+    except HookVerificationError as e:
+        logger.warning("[auth-hook] signature verification failed: %s", e)
+        raise HTTPException(status_code=401, detail=f"unauthorized: {e}")
+
+    try:
+        payload = parse_payload(body)
+    except ValueError as e:
+        logger.warning("[auth-hook] bad payload: %s", e)
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        result = await handle_send_email(payload)
+    except Exception as e:
+        # Surface as 5xx so Supabase's own retry/error path fires and
+        # the user gets a clean auth error rather than a silent no-send.
+        logger.error("[auth-hook] delivery failed: %r", e, exc_info=True)
+        raise HTTPException(status_code=502, detail=f"delivery failed: {e}")
+
+    return result
+
+
+@app.post("/admin/simulate-auth-email", tags=["Admin"])
+async def admin_simulate_auth_email(
+    to_address: str,
+    action: str = "magiclink",
+    admin_user_id: str = Depends(get_current_admin_id),
+):
+    """
+    Fires the auth-email hook handler with a synthetic Supabase payload —
+    NO real Supabase auth request needed. Lets an admin verify the OTP
+    template renders + Resend delivers, end-to-end, from the admin panel
+    without triggering a real login flow.
+    """
+    if "@" not in to_address:
+        raise HTTPException(status_code=400, detail="valid to_address required")
+
+    payload = {
+        "user": {
+            "id": "00000000-0000-0000-0000-000000000000",
+            "email": to_address,
+            "user_metadata": {"full_name": "Test User"},
+        },
+        "email_data": {
+            "token": "519247",
+            "token_hash": "test_token_hash",
+            "redirect_to": "",
+            "email_action_type": action,
+            "site_url": "",
+        },
+    }
+    logger.info("[auth-hook-sim] admin=%s action=%s to=%s", admin_user_id, action, to_address)
+    invalidate_config_cache()
+    return await handle_send_email(payload)
 
 
 @app.post("/admin/invalidate-app-config-cache", tags=["Admin"])
