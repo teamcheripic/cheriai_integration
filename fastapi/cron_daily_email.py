@@ -142,67 +142,70 @@ async def _pg_post(client: httpx.AsyncClient, table: str, payload: dict[str, Any
 # --- Eligibility -----------------------------------------------------------
 async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     """
-    Return one row per USER we should email, each carrying the notifications
-    that will be summarized in that user's email. Structure:
-        [
-          {
-            "user_id": ...,
-            "email":    ...,
-            "nick_name": ...,
-            "notifications": [ {id, type, title, body, created_at}, ... ]
-          },
-          ...
-        ]
+    Return one row per USER we should nudge. Structure:
+        [{
+          "user_id": ..., "email": ..., "nick_name": ...,
+          "unacted_matches": N,   # surfaced profiles they haven't engaged with
+          "pending_incoming": M,  # interests received but not accepted/declined
+          # Legacy field kept so render_email doesn't have to change:
+          "notifications": [ {"type": "match_available"} ] * N + [ {"type": "interest_received"} ] * M
+        }, ...]
+
+    Eligibility comes from the `list_users_needing_match_nudge()` RPC
+    (migration 023). The RPC derives eligibility directly from the DB
+    state (user_match_views + match_requests + matches) instead of
+    relying on notification rows existing — so a user with genuine
+    unacted matches gets emailed even if the app never wrote a
+    match_available notification for them.
+
+    Dedup: we skip users we've already emailed under the daily_match_nudge
+    campaign in the last min_age_hours (configurable) window, so a
+    misfire-and-retry within the same day doesn't double-send.
     """
     min_age_hours = await _cfg_min_age_hours()
     max_per_run = await _cfg_max_per_run()
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=min_age_hours)).isoformat()
+    dedup_cutoff = (datetime.now(timezone.utc) - timedelta(hours=min_age_hours)).isoformat()
 
-    # 1. Pull unread nudgeable notifications, oldest first (so the summary
-    #    email covers the earliest missed match first).
-    type_list = ",".join(NUDGEABLE_TYPES)
-    notifs = await _pg_get(
-        client,
-        "notifications",
-        {
-            "select": "id,user_id,type,title,body,created_at",
-            "type": f"in.({type_list})",
-            "read_at": "is.null",
-            "created_at": f"lt.{cutoff}",
-            "order": "created_at.asc",
-            # Over-fetch so grouping-by-user still yields ~max_per_run users
-            "limit": str(max_per_run * 4),
-        },
+    # 1. Ask the DB who needs a nudge (SECURITY DEFINER RPC — sees across users).
+    resp = await client.post(
+        f"{_PG_BASE}/rpc/list_users_needing_match_nudge",
+        headers=_PG_HEADERS,
+        json={},
+        timeout=30.0,
     )
-    if not notifs:
+    if resp.status_code >= 300:
+        logger.error("[cron] list_users_needing_match_nudge RPC failed [%s]: %s", resp.status_code, resp.text[:200])
+        return []
+    eligible = resp.json() or []
+    if not eligible:
+        logger.info("[cron] no eligible users")
         return []
 
-    # 2. Filter out notifications we've already emailed under this campaign.
-    notif_ids = [n["id"] for n in notifs]
-    already_sent_ids: set[str] = set()
-    # PostgREST `in.()` filter needs comma-joined values — chunk to keep the
-    # query string sane on very large backlogs.
-    for i in range(0, len(notif_ids), 100):
-        chunk = notif_ids[i : i + 100]
-        sent_rows = await _pg_get(
+    # 2. Dedup — skip anyone we've already emailed today under this campaign.
+    user_ids = [row["user_id"] for row in eligible]
+    already_sent: set[str] = set()
+    for i in range(0, len(user_ids), 100):
+        chunk = user_ids[i : i + 100]
+        rows = await _pg_get(
             client,
             "sent_emails",
             {
-                "select": "notification_id",
+                "select": "user_id",
                 "campaign": f"eq.{CAMPAIGN}",
-                "notification_id": f"in.({','.join(chunk)})",
+                "sent_at": f"gt.{dedup_cutoff}",
+                "user_id": f"in.({','.join(chunk)})",
             },
         )
-        for r in sent_rows:
-            if r.get("notification_id"):
-                already_sent_ids.add(r["notification_id"])
-
-    fresh = [n for n in notifs if n["id"] not in already_sent_ids]
-    if not fresh:
+        for r in rows:
+            if r.get("user_id"):
+                already_sent.add(r["user_id"])
+    eligible = [row for row in eligible if row["user_id"] not in already_sent]
+    if not eligible:
+        logger.info("[cron] all eligible users already emailed within dedup window")
         return []
 
-    # 3. Look up recipient emails from user_profiles for each unique user_id.
-    unique_user_ids = list({n["user_id"] for n in fresh})
+    # 3. Look up recipient emails.
+    unique_user_ids = [row["user_id"] for row in eligible]
     email_by_user: dict[str, dict[str, Any]] = {}
     for i in range(0, len(unique_user_ids), 100):
         chunk = unique_user_ids[i : i + 100]
@@ -218,25 +221,30 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
             if r.get("email"):
                 email_by_user[r["user_id"]] = r
 
-    # 4. Group notifications by user, drop users we have no email for, cap the
-    #    total number of users we'll email in this run.
-    by_user: dict[str, dict[str, Any]] = {}
-    for n in fresh:
-        prof = email_by_user.get(n["user_id"])
+    # 4. Build the send list. Keep render_email's shape by giving each
+    #    user a synthetic `notifications` list of the right length + type
+    #    mix — the render context only counts by type, doesn't use ids.
+    by_user: list[dict[str, Any]] = []
+    for row in eligible:
+        prof = email_by_user.get(row["user_id"])
         if not prof:
             continue
-        bucket = by_user.setdefault(
-            n["user_id"],
-            {
-                "user_id": n["user_id"],
-                "email": prof["email"],
-                "nick_name": prof.get("nick_name") or prof.get("full_name") or "there",
-                "notifications": [],
-            },
+        unacted = int(row.get("unacted_matches") or 0)
+        pending = int(row.get("pending_incoming") or 0)
+        synthetic_notifs: list[dict[str, Any]] = (
+            [{"type": "match_available", "id": "", "title": "", "body": ""}] * unacted
+            + [{"type": "interest_received", "id": "", "title": "", "body": ""}] * pending
         )
-        bucket["notifications"].append(n)
+        by_user.append({
+            "user_id": row["user_id"],
+            "email": prof["email"],
+            "nick_name": prof.get("nick_name") or prof.get("full_name") or "there",
+            "unacted_matches": unacted,
+            "pending_incoming": pending,
+            "notifications": synthetic_notifs,
+        })
 
-    return list(by_user.values())[:max_per_run]
+    return by_user[:max_per_run]
 
 
 # --- Email rendering + send -----------------------------------------------
