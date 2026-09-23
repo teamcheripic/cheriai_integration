@@ -57,6 +57,7 @@ from auth_email_hook import (
     verify_signature,
 )
 from canned_responses import classify as classify_canned, respond as respond_canned
+from partnership import finalize_partnership, PartnershipError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -362,6 +363,52 @@ async def admin_send_test_template(
         html_template=req.html_body,
         text_template=req.text_body or "",
     )
+
+
+class FinalizePartnershipRequest(BaseModel):
+    match_id: str
+
+    @validator("match_id")
+    def _valid_uuid(cls, v: str) -> str:
+        if not v or len(v) < 8:
+            raise ValueError("match_id is required")
+        return v
+
+
+@app.post("/matching/finalize-partnership", tags=["Matching"])
+async def matching_finalize_partnership(
+    req: FinalizePartnershipRequest,
+    user_id: str = Depends(get_current_user_id),
+):
+    """
+    Explicit partnership finalizer — no hidden DB triggers, no OF-clause
+    firing bugs. The client calls this after detecting both users have
+    accepted (partner_accepted_by_a AND partner_accepted_by_b both true).
+
+    Runs the full cleanup in one place (partnership.py). See that
+    module's docstring for the exact rules.
+
+    Auth: caller must be a participant in the match — enforced inside
+    finalize_partnership() by comparing against both user_a_id/user_b_id.
+    Idempotent — if the match is already partnered, returns immediately
+    without re-running the sweep.
+    """
+    logger.info("[partnership] finalize match=%s by user=%s", req.match_id, user_id)
+    try:
+        return await finalize_partnership(req.match_id, user_id)
+    except PartnershipError as e:
+        code = str(e)
+        status_code = 400
+        if code == "match_not_found":
+            status_code = 404
+        elif code == "not_a_participant":
+            status_code = 403
+        elif code == "both_must_accept_first":
+            status_code = 409  # conflict — not yet ready
+        raise HTTPException(status_code=status_code, detail=code)
+    except Exception as e:
+        logger.error("[partnership] finalize failed: %r", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"finalize_failed: {e}")
 
 
 @app.post("/auth/send-email-hook", tags=["Auth"])
