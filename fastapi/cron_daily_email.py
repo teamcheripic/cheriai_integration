@@ -464,11 +464,22 @@ async def send_test_email(to_address: str) -> dict[str, Any]:
 
 
 # Extra sample values injected only into the test-send context so admins
-# can preview templates that carry variables no cron currently supplies
-# (e.g. {{otp_code}} on auth_otp). Real sends of those templates fill
-# these keys from their own call site (the auth flow for otp_code).
+# can preview templates that carry variables no cron currently supplies.
+# Real sends of those templates fill these keys from their own call site
+# (auth flow for otp_code, Stripe webhook for billing fields, etc.).
 _TEST_EXTRA_VARS: dict[str, Any] = {
+    # Auth
     "otp_code": "519247",
+    # Billing templates
+    "plan_name": "Premium Lite",
+    "amount": "59.00",
+    "currency": "USD",
+    "payment_date": "2026-09-23",
+    "billing_period": "Sep 23 – Oct 23, 2026",
+    "next_billing_date": "2026-10-23",
+    "transaction_ref": "ch_3PQrsTUvWxYz1234567",
+    # Verification
+    "rejection_reason": "The selfie was too blurry to match the ID photo — please retake with better lighting.",
 }
 
 

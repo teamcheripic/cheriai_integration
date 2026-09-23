@@ -58,6 +58,7 @@ from auth_email_hook import (
 )
 from canned_responses import classify as classify_canned, respond as respond_canned
 from partnership import finalize_partnership, PartnershipError
+from transactional_email import send_transactional_email
 
 logging.basicConfig(
     level=logging.INFO,
@@ -373,6 +374,75 @@ class FinalizePartnershipRequest(BaseModel):
         if not v or len(v) < 8:
             raise ValueError("match_id is required")
         return v
+
+
+class SelfTriggerEmailRequest(BaseModel):
+    template_slug: str
+    extra_vars: Optional[dict] = None
+    dedup_window_hours: int = 1
+
+
+@app.post("/emails/trigger-self", tags=["Email"])
+async def trigger_self_email(
+    req: SelfTriggerEmailRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    Fire a transactional email TO THE AUTHED USER themselves. For
+    events driven by user action — welcome-on-registration,
+    account-deletion-request, etc. The user_id is always the caller,
+    which prevents spam vectors.
+
+    template_slug must be one of the 18 in email_templates. extra_vars
+    optional (most user-triggered emails don't need them).
+    """
+    logger.info(
+        "[trigger-self-email] user=%s template=%s",
+        caller_user_id, req.template_slug,
+    )
+    ok = await send_transactional_email(
+        user_id=caller_user_id,
+        template_slug=req.template_slug,
+        extra_vars=req.extra_vars,
+        dedup_window_hours=req.dedup_window_hours,
+    )
+    return {"ok": ok, "template": req.template_slug}
+
+
+class AdminTriggerEmailRequest(BaseModel):
+    user_id: str
+    template_slug: str
+    extra_vars: Optional[dict] = None
+    dedup_window_hours: int = 1
+
+
+@app.post("/admin/trigger-email", tags=["Admin"])
+async def admin_trigger_email(
+    req: AdminTriggerEmailRequest,
+    admin_user_id: str = Depends(get_current_admin_id),
+):
+    """
+    Admin-only: fire any of the 18 transactional templates for any
+    user_id. Used by:
+      • KYC approval/rejection UI       → verify_approved / verify_needs_attention
+      • Admin verification revoke       → verify_revoked
+      • Suspend / reactivate flows      → account_suspended / account_reactivated
+      • Support email-change action     → email_changed (to new address)
+      • Support account-deletion action → account_deleted
+      • Stripe webhook is separate — that runs server-to-server (no
+        admin JWT needed) via send_transactional_email directly.
+    """
+    logger.info(
+        "[admin-trigger-email] admin=%s user=%s template=%s",
+        admin_user_id, req.user_id, req.template_slug,
+    )
+    ok = await send_transactional_email(
+        user_id=req.user_id,
+        template_slug=req.template_slug,
+        extra_vars=req.extra_vars,
+        dedup_window_hours=req.dedup_window_hours,
+    )
+    return {"ok": ok, "template": req.template_slug, "user_id": req.user_id}
 
 
 @app.post("/matching/finalize-partnership", tags=["Matching"])
