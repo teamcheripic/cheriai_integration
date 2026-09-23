@@ -237,10 +237,17 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                     )
                     third_parties_notified.add(third_party)
 
-        # ---- 4. Decline pending match_requests for either partner ----
+        # ---- 4. DELETE pending match_requests for either partner ----
+        # Not 'declined' (misleading — receiver never said no) and not
+        # 'expired' (leaves a dead row that hides the "Show Interest"
+        # button if the receiver ever becomes available again). DELETE
+        # is the cleanest — the request goes away entirely, and if the
+        # receiver ever unpartners, the sender's UI shows a fresh
+        # "Show Interest" button as if nothing happened.
+        # 'declined' rows from real user actions stay untouched.
         # PostgREST `in.` filter needs comma-joined UUIDs.
         partner_ids_csv = ",".join(partner_ids)
-        await _pg_patch(
+        await _pg_delete(
             client,
             "match_requests",
             {
@@ -250,7 +257,6 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                     f"receiver_id.in.({partner_ids_csv}))"
                 ),
             },
-            {"status": "declined"},
         )
         # We don't get a row count from PATCH without a follow-up read;
         # count is informational so we skip a second query.
