@@ -265,7 +265,11 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
         unacted = int(row.get("unacted_matches") or 0)
         pending = int(row.get("pending_incoming") or 0)
         waiting = int(row.get("candidates_waiting") or 0)
-        match_avail_count = unacted + waiting
+        # After migration 026, Signal 3 fires regardless of view-row
+        # state — so Signals 1 and 3 typically reference the same
+        # candidates. Take the higher of the two to avoid inflating the
+        # "N matches waiting" count on the email.
+        match_avail_count = max(unacted, waiting)
         synthetic_notifs: list[dict[str, Any]] = (
             [{"type": "match_available", "id": "", "title": "", "body": ""}] * match_avail_count
             + [{"type": "interest_received", "id": "", "title": "", "body": ""}] * pending
