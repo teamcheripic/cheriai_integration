@@ -18,7 +18,7 @@ import os
 import logging
 import math
 from datetime import datetime
-from typing import Optional, List
+from typing import Any, Optional, List
 from contextlib import asynccontextmanager
 import asyncio
 
@@ -563,6 +563,13 @@ async def matching_notify_interest_received(
                     "type": "interest_received",
                     "title": "Someone is interested in you",
                     "body": "Open your requests to see who — and decide whether to accept.",
+                    # related_user_id lets the partnership-finalize sweep
+                    # (partnership.py step 7) identify and delete this
+                    # notification when the SENDER later partners with
+                    # someone else. Without this, third parties would
+                    # still see "User A is interested in you" after A
+                    # partnered up. Same convention as partner_dropped.
+                    "related_user_id": caller_user_id,
                 },
                 headers={
                     "apikey": SUPABASE_KEY,
@@ -590,6 +597,180 @@ async def matching_notify_interest_received(
         # "the interest send succeeded, this side-channel is bonus".
         logger.error("[interest-received] notify failed: %r", e, exc_info=True)
 
+    return {"ok": True}
+
+
+class NotifyPartnerProposalRequest(BaseModel):
+    """Body for /matching/notify-partner-proposal.
+
+    The sender_id is derived from the JWT. Server verifies caller is
+    one of the participants in match_id before writing the
+    notification to the OTHER participant — prevents anyone from
+    forging "make it official" notifications for someone they aren't
+    matched with.
+    """
+    match_id: str
+
+
+@app.post("/matching/notify-partner-proposal", tags=["Matching"])
+async def matching_notify_partner_proposal(
+    req: NotifyPartnerProposalRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    Fire-and-forget from acceptPartnership() when the caller is the
+    FIRST side to tap "Make it Official". Notifies the OTHER
+    participant so they see the proposal without needing to be
+    actively viewing the match.
+
+    Never raises — a downstream failure never blocks the acceptance
+    that already succeeded client-side. Uses service key so RLS on
+    notifications can't silently drop the cross-user insert (which is
+    what was happening from the client's own session).
+    """
+    logger.info("[partner-proposal] match=%s caller=%s", req.match_id, caller_user_id)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Verify caller is a participant in the match.
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/matches",
+                params={
+                    "select": "user_a_id,user_b_id,is_active,partnered_at",
+                    "id": f"eq.{req.match_id}",
+                    "limit": "1",
+                },
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                },
+            )
+            rows = resp.json() if resp.status_code < 300 else []
+            if not rows:
+                return {"ok": True, "skipped": "match_not_found"}
+            m = rows[0]
+            if caller_user_id not in (m.get("user_a_id"), m.get("user_b_id")):
+                return {"ok": True, "skipped": "not_a_participant"}
+            other_id = m["user_b_id"] if m["user_a_id"] == caller_user_id else m["user_a_id"]
+
+            # Dedup — don't spam if the caller re-taps.
+            existing = await client.get(
+                f"{SUPABASE_URL}/rest/v1/notifications",
+                params={
+                    "select": "id",
+                    "user_id": f"eq.{other_id}",
+                    "type": "eq.partner_proposal",
+                    "related_user_id": f"eq.{caller_user_id}",
+                    "limit": "1",
+                },
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                },
+            )
+            if existing.status_code < 300 and existing.json():
+                return {"ok": True, "skipped": "duplicate"}
+
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/notifications",
+                json={
+                    "user_id": other_id,
+                    "type": "partner_proposal",
+                    "title": "Someone wants to make it official 💞",
+                    "body": "Open your connection to review and accept.",
+                    "related_user_id": caller_user_id,
+                    "related_id": req.match_id,
+                },
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+            )
+    except Exception as e:
+        logger.error("[partner-proposal] notify failed: %r", e, exc_info=True)
+    return {"ok": True}
+
+
+class NotifyUnmatchRequest(BaseModel):
+    """Body for /matching/notify-unmatch. Caller is the user who
+    initiated the unmatch (from JWT). Notifies the OTHER user (and
+    optionally the caller too — see was_partnered)."""
+    other_user_id: str
+    was_partnered: bool = False
+
+
+@app.post("/matching/notify-unmatch", tags=["Matching"])
+async def matching_notify_unmatch(
+    req: NotifyUnmatchRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    Fire-and-forget from unmatchUser() after the DB updates land.
+    Inserts one notification for the other user (always), plus a
+    self-notification for the initiator when this was a partnership
+    (so their own inbox reflects the ended relationship).
+
+    Uses service key so cross-user inserts land regardless of RLS.
+    Never raises to the caller — the unmatch itself already
+    succeeded client-side.
+    """
+    logger.info(
+        "[unmatch-notify] caller=%s other=%s partnered=%s",
+        caller_user_id, req.other_user_id, req.was_partnered,
+    )
+    try:
+        # Pull nick_names for personalized copy — same privacy rule
+        # as unmatchUser (nick_name only, never full_name).
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            profs = await client.get(
+                f"{SUPABASE_URL}/rest/v1/public_profiles",
+                params={
+                    "select": "user_id,nick_name",
+                    "user_id": f"in.({caller_user_id},{req.other_user_id})",
+                },
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                },
+            )
+            name_by_id: dict[str, str] = {}
+            if profs.status_code < 300:
+                for p in profs.json():
+                    name_by_id[p["user_id"]] = p.get("nick_name") or "Someone"
+            caller_label = name_by_id.get(caller_user_id, "Someone")
+            other_label = name_by_id.get(req.other_user_id, "Someone")
+
+            notifs: list[dict[str, Any]] = [
+                {
+                    "user_id": req.other_user_id,
+                    "type": "unmatched",
+                    "title": f"You and {caller_label} ended your relationship",
+                    "body": "You're now open to new opportunities when you're ready.",
+                    "related_user_id": caller_user_id,
+                },
+            ]
+            if req.was_partnered:
+                notifs.append({
+                    "user_id": caller_user_id,
+                    "type": "unmatched",
+                    "title": f"You and {other_label} ended your relationship",
+                    "body": "You're now open to new opportunities when you're ready.",
+                    "related_user_id": req.other_user_id,
+                })
+
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/notifications",
+                json=notifs,
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+            )
+    except Exception as e:
+        logger.error("[unmatch-notify] failed: %r", e, exc_info=True)
     return {"ok": True}
 
 

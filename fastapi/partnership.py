@@ -27,15 +27,28 @@ What "finalize" does (in order, all with the service_role client):
          c. DELETE all match_reads for that match_id
          d. INSERT a partner_dropped notification for the third party
             (deduped so re-runs don't spam)
-    4. Decline every pending match_requests to/from either partner.
+    4. DELETE every match_requests row to/from either partner,
+       regardless of status (pending/accepted/declined/expired).
+       Previously only 'pending' was deleted — the leftover declined
+       and accepted rows still appeared in the third parties' sent /
+       received lists as if the partners were still discoverable.
     5. DELETE every user_match_views row involving either partner —
        both directions. Clears Home stories, Discover, and frees the
        third parties' quota slots.
+    6. DELETE stale matching-related notifications for the PARTNERS
+       themselves. Keeps identity / billing / system notifications
+       (KYC verified, payment successful, etc.) so their inbox still
+       has real audit history — only the now-irrelevant matching
+       stream is wiped.
+    7. DELETE matching-related notifications ABOUT the partners for
+       every other user on the platform. Third parties no longer see
+       "User A was interested in you" once A has partnered up. Same
+       type-whitelist as step 6 so identity/billing history is kept.
 
 Rules preserved from the user's spec:
     • Partnership match itself is NEVER touched by the sweep (id filter)
     • Messages between the two partners are KEPT
-    • Third parties always get a notification
+    • Third parties always get a partner_dropped notification (step 3d)
     • Cleanup is idempotent — safe to re-run
 """
 
@@ -162,6 +175,38 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
             {"partnered_at": now_iso},
         )
 
+        # ---- 2b. Notify both partners that the partnership is now
+        # official. Neither side gets a `partnered` notification from
+        # any other path — the client-side realtime channel picks up
+        # the DB update, but users who weren't looking at the match
+        # screen at that moment would never learn. Insert one row per
+        # partner; each references the OTHER partner via
+        # related_user_id so the notification UI can render an avatar
+        # + route to the Red Room chat. Service-role client, so RLS
+        # on notifications can't drop the cross-user writes.
+        await _pg_post(
+            client,
+            "notifications",
+            [
+                {
+                    "user_id": partner_ids[0],
+                    "type": "partnered",
+                    "title": "You made it official 💞",
+                    "body": "New introductions are paused while you focus on each other.",
+                    "related_user_id": partner_ids[1],
+                    "related_id": match_id,
+                },
+                {
+                    "user_id": partner_ids[1],
+                    "type": "partnered",
+                    "title": "You made it official 💞",
+                    "body": "New introductions are paused while you focus on each other.",
+                    "related_user_id": partner_ids[0],
+                    "related_id": match_id,
+                },
+            ],
+        )
+
         # ---- 3. Sweep side matches for both partners ----
         side_matches_deactivated = 0
         third_parties_notified: set[str] = set()
@@ -237,21 +282,21 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                     )
                     third_parties_notified.add(third_party)
 
-        # ---- 4. DELETE pending match_requests for either partner ----
-        # Not 'declined' (misleading — receiver never said no) and not
-        # 'expired' (leaves a dead row that hides the "Show Interest"
-        # button if the receiver ever becomes available again). DELETE
-        # is the cleanest — the request goes away entirely, and if the
-        # receiver ever unpartners, the sender's UI shows a fresh
-        # "Show Interest" button as if nothing happened.
-        # 'declined' rows from real user actions stay untouched.
-        # PostgREST `in.` filter needs comma-joined UUIDs.
+        # ---- 4. DELETE every match_requests row involving either partner ----
+        # ALL statuses — pending, accepted, declined, expired. The
+        # partners' new life is with each other; every prior request
+        # should be gone from BOTH sides' request lists so nobody sees
+        # "you accepted so-and-so a month ago" for someone who's now
+        # partnered. Previously this step limited to status=pending,
+        # which left declined/expired rows on the third parties'
+        # sent-requests screen — the user reported this on
+        # 2026-09-24 as "should be removed everywhere including
+        # intrests, connect or requests".
         partner_ids_csv = ",".join(partner_ids)
         await _pg_delete(
             client,
             "match_requests",
             {
-                "status": "eq.pending",
                 "or": (
                     f"(sender_id.in.({partner_ids_csv}),"
                     f"receiver_id.in.({partner_ids_csv}))"
@@ -260,7 +305,7 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
         )
         # We don't get a row count from PATCH without a follow-up read;
         # count is informational so we skip a second query.
-        requests_declined = "count_not_tracked"
+        requests_deleted = "count_not_tracked"
 
         # ---- 5. Delete user_match_views involving either partner ----
         # Both directions: rows where the partner is the viewer AND rows
@@ -278,11 +323,72 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                 {"target_user_id": f"eq.{uid}"},
             )
 
+        # ---- 6 & 7. Notification sweep ----
+        # Matching-related notification types the sweep zaps. Everything
+        # NOT on this list survives — verify_approved / verify_revoked /
+        # payment_successful / account_suspended / etc. remain in the
+        # user's inbox as real audit history. Add new types here if they
+        # ever get introduced to the matching flow.
+        MATCHING_NOTIF_TYPES_FOR_PARTNERS = (
+            "interest_received",     # someone sent them interest
+            "interest_accepted",     # their interest was accepted
+            "match_available",       # a candidate was surfaced
+            "match_accepted",        # their interest was accepted (alt naming)
+            "match_declined",        # their interest was declined
+            "match_expired",         # a pending request expired
+            "match_created",         # legacy — mutual match created
+            "new_match",             # legacy naming
+            "partner_dropped",       # they were dropped by someone who partnered
+            "partner_proposal",      # someone asked them to make it official
+            # We deliberately KEEP `partnered` in the partners' own
+            # inbox — it's the "you made it official" celebration
+            # notification we just wrote in step 2b, and it's the only
+            # signal that the partnership is live. Not stale history.
+        )
+        # For third parties we keep the partner_dropped rows we just
+        # INSERTED in step 3d — those are the ONE piece of information
+        # they SHOULD still see. Only the stale outgoing / incoming
+        # matching signals about the partners are wiped.
+        MATCHING_NOTIF_TYPES_FOR_THIRD_PARTIES = tuple(
+            t for t in MATCHING_NOTIF_TYPES_FOR_PARTNERS if t != "partner_dropped"
+        )
+
+        # ---- 6. DELETE matching-related notifications for the PARTNERS ----
+        # Both partners' inboxes are cleared of every past matching
+        # signal (interest received, matches surfaced, etc.). Their
+        # KYC / billing / system notifications stay put.
+        await _pg_delete(
+            client,
+            "notifications",
+            {
+                "user_id": f"in.({partner_ids_csv})",
+                "type": f"in.({','.join(MATCHING_NOTIF_TYPES_FOR_PARTNERS)})",
+            },
+        )
+
+        # ---- 7. DELETE matching-related notifications ABOUT the partners
+        # for every third party. Anything a third party has related to
+        # either partner — "User A is interested in you", "You matched
+        # with User B", etc. — is gone once the partnership is
+        # finalized. Guarded on related_user_id so unrelated matches
+        # in the same third party's inbox aren't touched. partner_dropped
+        # is intentionally excluded from the type list so the "connection
+        # has ended" notice we just wrote in step 3d survives the sweep.
+        await _pg_delete(
+            client,
+            "notifications",
+            {
+                "related_user_id": f"in.({partner_ids_csv})",
+                "type": f"in.({','.join(MATCHING_NOTIF_TYPES_FOR_THIRD_PARTIES)})",
+                "user_id": f"not.in.({partner_ids_csv})",
+            },
+        )
+
         return {
             "match_id": match_id,
             "partnered_at": now_iso,
             "already_finalized": False,
             "side_matches_deactivated": side_matches_deactivated,
             "third_parties_notified": len(third_parties_notified),
-            "requests_declined": requests_declined,
+            "requests_deleted": requests_deleted,
         }
