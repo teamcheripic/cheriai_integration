@@ -646,13 +646,21 @@ async def matching_notify_partner_proposal(
             )
             rows = resp.json() if resp.status_code < 300 else []
             if not rows:
+                logger.warning("[partner-proposal] match_not_found match=%s", req.match_id)
                 return {"ok": True, "skipped": "match_not_found"}
             m = rows[0]
             if caller_user_id not in (m.get("user_a_id"), m.get("user_b_id")):
+                logger.warning(
+                    "[partner-proposal] not_a_participant match=%s caller=%s a=%s b=%s",
+                    req.match_id, caller_user_id, m.get("user_a_id"), m.get("user_b_id"),
+                )
                 return {"ok": True, "skipped": "not_a_participant"}
             other_id = m["user_b_id"] if m["user_a_id"] == caller_user_id else m["user_a_id"]
 
-            # Dedup — don't spam if the caller re-taps.
+            # Dedup — don't spam if the caller re-taps. Only skips when
+            # the OTHER side has an UNREAD proposal from this caller;
+            # a read/dismissed one no longer blocks a fresh re-tap so
+            # a user isn't stuck seeing "duplicate" after they've read.
             existing = await client.get(
                 f"{SUPABASE_URL}/rest/v1/notifications",
                 params={
@@ -660,6 +668,7 @@ async def matching_notify_partner_proposal(
                     "user_id": f"eq.{other_id}",
                     "type": "eq.partner_proposal",
                     "related_user_id": f"eq.{caller_user_id}",
+                    "read_at": "is.null",
                     "limit": "1",
                 },
                 headers={
@@ -668,9 +677,13 @@ async def matching_notify_partner_proposal(
                 },
             )
             if existing.status_code < 300 and existing.json():
+                logger.info(
+                    "[partner-proposal] skipped duplicate: caller=%s other=%s already has unread proposal",
+                    caller_user_id, other_id,
+                )
                 return {"ok": True, "skipped": "duplicate"}
 
-            await client.post(
+            ins = await client.post(
                 f"{SUPABASE_URL}/rest/v1/notifications",
                 json={
                     "user_id": other_id,
@@ -687,9 +700,24 @@ async def matching_notify_partner_proposal(
                     "Prefer": "return=minimal",
                 },
             )
+            # Surface the ACTUAL insert result. Silent 4xx (CHECK
+            # constraint violation, RLS, missing column) is what hid
+            # this bug for hours — Railway logs now show the exact
+            # rejection so we can see why an insert didn't land.
+            if ins.status_code >= 300:
+                logger.error(
+                    "[partner-proposal] insert failed [%s]: %s (payload other=%s caller=%s)",
+                    ins.status_code, ins.text[:400], other_id, caller_user_id,
+                )
+                return {"ok": False, "insert_status": ins.status_code, "detail": ins.text[:400]}
+            logger.info(
+                "[partner-proposal] inserted: other=%s caller=%s match=%s",
+                other_id, caller_user_id, req.match_id,
+            )
     except Exception as e:
         logger.error("[partner-proposal] notify failed: %r", e, exc_info=True)
-    return {"ok": True}
+        return {"ok": False, "exception": str(e)}
+    return {"ok": True, "inserted": True}
 
 
 class NotifyUnmatchRequest(BaseModel):
