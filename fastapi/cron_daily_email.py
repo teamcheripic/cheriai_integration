@@ -224,6 +224,9 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
     # 4. Build the send list. Keep render_email's shape by giving each
     #    user a synthetic `notifications` list of the right length + type
     #    mix — the render context only counts by type, doesn't use ids.
+    #    candidates_waiting rolls up under match_available so the email
+    #    reads as "N new potential connections waiting" regardless of
+    #    whether the user has surfaced them yet.
     by_user: list[dict[str, Any]] = []
     for row in eligible:
         prof = email_by_user.get(row["user_id"])
@@ -231,8 +234,10 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
             continue
         unacted = int(row.get("unacted_matches") or 0)
         pending = int(row.get("pending_incoming") or 0)
+        waiting = int(row.get("candidates_waiting") or 0)
+        match_avail_count = unacted + waiting
         synthetic_notifs: list[dict[str, Any]] = (
-            [{"type": "match_available", "id": "", "title": "", "body": ""}] * unacted
+            [{"type": "match_available", "id": "", "title": "", "body": ""}] * match_avail_count
             + [{"type": "interest_received", "id": "", "title": "", "body": ""}] * pending
         )
         by_user.append({
@@ -241,6 +246,7 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
             "nick_name": prof.get("nick_name") or prof.get("full_name") or "there",
             "unacted_matches": unacted,
             "pending_incoming": pending,
+            "candidates_waiting": waiting,
             "notifications": synthetic_notifs,
         })
 
