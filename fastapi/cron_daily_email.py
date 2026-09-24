@@ -38,7 +38,7 @@ from typing import Any
 import httpx
 
 from supabase_client import SUPABASE_KEY, SUPABASE_URL
-from app_config import get_config, get_int
+from app_config import get_config, get_int, get_bool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -106,10 +106,40 @@ async def _cfg_unsubscribe_url() -> str:
     app_base = await _cfg_app_base_url()
     return f"{app_base}/#/profile"
 
-# Master switch for the in-process APScheduler wiring in main.py. Off by
-# default so a first Railway deploy of this file cannot start sending mail
-# before the operator has set RESEND_API_KEY and reviewed the eligibility
-# query. Set ENABLE_DAILY_EMAIL_CRON=true on Railway to turn it on.
+# --- Scheduler config (LIVE from app_config) -------------------------------
+# Both settings below are read on every supervisor tick (~60s), so an admin
+# flipping the toggle or editing the crontab in the panel takes effect
+# within a minute — no Railway redeploy.
+#
+# Precedence per app_config.get_*: DB row (if non-empty) → env var → default.
+# The env vars (ENABLE_DAILY_EMAIL_CRON, DAILY_EMAIL_CRON) remain as
+# bootstrap fallbacks for a fresh Railway deploy where the DB row isn't
+# populated yet.
+DEFAULT_CRON_SCHEDULE = "30 8 * * *"   # 08:30 UTC = 14:00 IST
+
+
+async def scheduler_enabled_async() -> bool:
+    """Master on/off for the in-process daily-nudge scheduler. Live."""
+    return await get_bool(
+        "daily_email_cron_enabled",
+        env_key="ENABLE_DAILY_EMAIL_CRON",
+        default=False,
+    )
+
+
+async def scheduler_crontab_async() -> str:
+    """Crontab string (UTC) for the daily nudge job. Live."""
+    val = await get_config(
+        "daily_email_cron_schedule",
+        env_key="DAILY_EMAIL_CRON",
+        default=DEFAULT_CRON_SCHEDULE,
+    )
+    return (val or DEFAULT_CRON_SCHEDULE).strip()
+
+
+# Backwards-compat sync wrapper for any caller still importing the old name.
+# Returns the env-var value only (can't await from sync context). Not used
+# by the live supervisor path.
 def scheduler_enabled() -> bool:
     return os.getenv("ENABLE_DAILY_EMAIL_CRON", "").strip().lower() in ("1", "true", "yes", "on")
 

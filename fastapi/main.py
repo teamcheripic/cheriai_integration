@@ -44,7 +44,8 @@ from tier_limits import get_monthly_limits, STRIPE_PRICE_TO_TIER, describe_limit
 import billing
 from cron_daily_email import (
     run_once as run_daily_email_cron,
-    scheduler_enabled as daily_email_enabled,
+    scheduler_enabled_async as daily_email_enabled_async,
+    scheduler_crontab_async as daily_email_crontab_async,
     send_test_email,
     send_template_test_email,
 )
@@ -212,34 +213,78 @@ async def lifespan(app: FastAPI):
     # ---- In-process scheduler for the daily match-nudge email --------------
     # Railway hobby plans don't ship a first-class cron for single-container
     # apps. Since the FastAPI process is always-on anyway, APScheduler ticks
-    # cheaply alongside it. Guarded by ENABLE_DAILY_EMAIL_CRON so setting up
-    # RESEND_API_KEY doesn't accidentally start a live blast.
+    # cheaply alongside it.
+    #
+    # Both the master on/off and the crontab live in public.app_config
+    # (daily_email_cron_enabled / daily_email_cron_schedule). A supervisor
+    # tick runs every 15 min and reconciles the actual APScheduler job
+    # against those values — arming it, disarming it, or rewriting its
+    # trigger as the admin changes them in the panel. No Railway redeploy
+    # required.
+    #
+    # Why 15 min, not 60s: the daily cron fires ONCE per day. The admin
+    # touches the schedule maybe once a month. 15 min drops the ambient
+    # REST poll ~15× (96 req/day vs 1,440 req/day) with no meaningful
+    # user-facing cost — admins who want an instant sanity check can hit
+    # "Trigger the daily nudge cron now" in Email Campaigns.
     app.state.scheduler = None
-    if daily_email_enabled():
-        try:
-            from apscheduler.schedulers.asyncio import AsyncIOScheduler
-            from apscheduler.triggers.cron import CronTrigger
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.triggers.interval import IntervalTrigger
 
-            # UTC-anchored so the job doesn't drift on DST-observing hosts.
-            # 08:30 UTC = 14:00 IST, which is a reasonable weekday-afternoon
-            # inbox nudge for the current user base.
-            cron_expr = os.getenv("DAILY_EMAIL_CRON", "30 8 * * *")
-            scheduler = AsyncIOScheduler(timezone="UTC")
-            scheduler.add_job(
-                run_daily_email_cron,
-                CronTrigger.from_crontab(cron_expr, timezone="UTC"),
-                id="daily_match_nudge",
-                max_instances=1,
-                coalesce=True,      # missed run while worker was down → run once, not N times
-                misfire_grace_time=3600,
-            )
-            scheduler.start()
-            app.state.scheduler = scheduler
-            logger.info("Daily email cron scheduled (UTC cron: '%s')", cron_expr)
-        except Exception as e:
-            logger.error("Could not start daily email scheduler: %r", e, exc_info=True)
-    else:
-        logger.info("Daily email cron is DISABLED (set ENABLE_DAILY_EMAIL_CRON=true to enable).")
+        # UTC-anchored so the daily job doesn't drift on DST-observing hosts.
+        scheduler = AsyncIOScheduler(timezone="UTC")
+
+        async def _reconcile_daily_nudge() -> None:
+            try:
+                enabled = await daily_email_enabled_async()
+                wanted = (await daily_email_crontab_async()) or "30 8 * * *"
+                job = scheduler.get_job("daily_match_nudge")
+                if not enabled:
+                    if job:
+                        scheduler.remove_job("daily_match_nudge")
+                        logger.info("Daily email cron DISARMED (admin toggle off).")
+                    return
+                # enabled — decide add vs. reschedule vs. leave alone
+                current = getattr(job, "_cheripic_cron", None) if job else None
+                if job is None:
+                    scheduler.add_job(
+                        run_daily_email_cron,
+                        CronTrigger.from_crontab(wanted, timezone="UTC"),
+                        id="daily_match_nudge",
+                        max_instances=1,
+                        coalesce=True,
+                        misfire_grace_time=3600,
+                    )
+                    scheduler.get_job("daily_match_nudge")._cheripic_cron = wanted
+                    logger.info("Daily email cron ARMED (UTC crontab: '%s').", wanted)
+                elif current != wanted:
+                    scheduler.reschedule_job(
+                        "daily_match_nudge",
+                        trigger=CronTrigger.from_crontab(wanted, timezone="UTC"),
+                    )
+                    scheduler.get_job("daily_match_nudge")._cheripic_cron = wanted
+                    logger.info("Daily email cron RESCHEDULED (UTC crontab: '%s').", wanted)
+            except Exception as e:
+                logger.error("Cron supervisor tick failed: %r", e, exc_info=True)
+
+        # First reconciliation before the loop starts, so a healthy DB row
+        # is honored immediately at boot instead of waiting up to 60s.
+        await _reconcile_daily_nudge()
+
+        scheduler.add_job(
+            _reconcile_daily_nudge,
+            IntervalTrigger(minutes=15),
+            id="daily_nudge_supervisor",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.start()
+        app.state.scheduler = scheduler
+        logger.info("Cron supervisor running (15-min reconcile against app_config).")
+    except Exception as e:
+        logger.error("Could not start email scheduler: %r", e, exc_info=True)
 
     yield
     if getattr(app.state, "scheduler", None):
