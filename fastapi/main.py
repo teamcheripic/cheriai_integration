@@ -22,6 +22,7 @@ from typing import Optional, List
 from contextlib import asynccontextmanager
 import asyncio
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
@@ -30,7 +31,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from auth import get_current_user_id, get_current_admin_id, require_self
-from supabase_client import supabase
+from supabase_client import supabase, SUPABASE_URL, SUPABASE_KEY
 from llm_client import send_to_llm
 from cheriai_prompts import CheriAIPromptBuilder
 from user_memory import (
@@ -488,6 +489,108 @@ async def admin_trigger_email(
         dedup_window_hours=req.dedup_window_hours,
     )
     return {"ok": ok, "template": req.template_slug, "user_id": req.user_id}
+
+
+class NotifyInterestReceivedRequest(BaseModel):
+    """Body for /matching/notify-interest-received.
+
+    The sender_id is derived from the JWT — the request only names the
+    receiver, so a malicious client can't spoof interest coming from
+    someone else. The server verifies a pending match_requests row
+    exists (sender=caller, receiver=req.receiver_user_id) before
+    inserting the notification / sending the email — that prevents
+    the endpoint from being used as a "notify anyone with anything"
+    spam relay.
+    """
+    receiver_user_id: str
+
+
+@app.post("/matching/notify-interest-received", tags=["Matching"])
+async def matching_notify_interest_received(
+    req: NotifyInterestReceivedRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    Fire-and-forget from the frontend after `sendMatchRequestSimple`.
+    Does two things:
+      1. Insert a `notifications` row of type 'interest_received' for
+         the receiver so the in-app bell shows a red dot immediately.
+      2. Send the `interest_received` transactional email to the
+         receiver (dedup 2h, so multiple senders in a short burst
+         yield one email — reduces cost + avoids inbox spam).
+
+    Never raises to the caller — a downstream failure here must NOT
+    fail the interest send. All errors are logged and swallowed;
+    response is {"ok": true} unconditionally so the client's
+    fire-and-forget contract holds.
+    """
+    logger.info(
+        "[interest-received] sender=%s receiver=%s",
+        caller_user_id, req.receiver_user_id,
+    )
+    try:
+        # Verify the match_requests row actually exists. Without this
+        # gate, any authed user could POST arbitrary receiver_user_id
+        # values and cause noise notifications / emails.
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                f"{SUPABASE_URL}/rest/v1/match_requests",
+                params={
+                    "select": "id",
+                    "sender_id": f"eq.{caller_user_id}",
+                    "receiver_id": f"eq.{req.receiver_user_id}",
+                    "status": "eq.pending",
+                    "limit": "1",
+                },
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                },
+            )
+            if resp.status_code >= 300 or not resp.json():
+                logger.warning(
+                    "[interest-received] no pending row for sender=%s → receiver=%s (status=%s), skipping notify",
+                    caller_user_id, req.receiver_user_id, resp.status_code,
+                )
+                return {"ok": True, "skipped": "no_pending_row"}
+
+            # Insert the in-app notification (service key bypasses RLS).
+            # Best-effort — a failure to insert doesn't block the email.
+            notif_resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/notifications",
+                json={
+                    "user_id": req.receiver_user_id,
+                    "type": "interest_received",
+                    "title": "Someone is interested in you",
+                    "body": "Open your requests to see who — and decide whether to accept.",
+                },
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+            )
+            if notif_resp.status_code >= 300:
+                logger.warning(
+                    "[interest-received] notification insert failed [%s]: %s",
+                    notif_resp.status_code, notif_resp.text[:200],
+                )
+
+        # Send the email. dedup=2h so 5 senders in 90 min → 1 email.
+        # send_transactional_email never raises; it returns False on
+        # any skip/failure and logs internally.
+        await send_transactional_email(
+            user_id=req.receiver_user_id,
+            template_slug="interest_received",
+            dedup_window_hours=2,
+        )
+    except Exception as e:
+        # Log but never surface — the fire-and-forget contract is
+        # "the interest send succeeded, this side-channel is bonus".
+        logger.error("[interest-received] notify failed: %r", e, exc_info=True)
+
+    return {"ok": True}
 
 
 @app.post("/matching/finalize-partnership", tags=["Matching"])
