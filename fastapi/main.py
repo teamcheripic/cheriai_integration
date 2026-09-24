@@ -787,7 +787,7 @@ async def matching_notify_unmatch(
                     "related_user_id": req.other_user_id,
                 })
 
-            await client.post(
+            ins = await client.post(
                 f"{SUPABASE_URL}/rest/v1/notifications",
                 json=notifs,
                 headers={
@@ -797,8 +797,19 @@ async def matching_notify_unmatch(
                     "Prefer": "return=minimal",
                 },
             )
+            if ins.status_code >= 300:
+                # Most likely notifications_type_check without migration 029
+                # applied. Surface it explicitly instead of silently
+                # returning ok:True.
+                logger.error(
+                    "[unmatch-notify] insert failed [%s]: %s",
+                    ins.status_code, ins.text[:400],
+                )
+                return {"ok": False, "insert_status": ins.status_code, "detail": ins.text[:400]}
+            logger.info("[unmatch-notify] inserted %d rows", len(notifs))
     except Exception as e:
         logger.error("[unmatch-notify] failed: %r", e, exc_info=True)
+        return {"ok": False, "exception": str(e)}
     return {"ok": True}
 
 

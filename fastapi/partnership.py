@@ -118,6 +118,35 @@ async def _pg_post(client: httpx.AsyncClient, path: str, payload: dict[str, Any]
         raise PartnershipError(f"POST {path} failed [{resp.status_code}]: {resp.text[:200]}")
 
 
+async def _pg_post_soft(client: httpx.AsyncClient, path: str, payload: dict[str, Any] | list[dict[str, Any]]) -> bool:
+    """
+    Like _pg_post but NEVER raises. Returns True on success, False on
+    any failure (logged). Used for courtesy notification inserts that
+    must NOT abort the surrounding cleanup sweep — e.g. if the
+    notifications_type_check migration isn't applied yet, a 23514
+    would otherwise cascade up and skip the entire partnership sweep,
+    leaving stale rows in match_requests / user_match_views / etc.
+    Better to lose the courtesy notification than the isolation.
+    """
+    try:
+        resp = await client.post(
+            f"{_PG_BASE}/{path}",
+            json=payload,
+            headers=_PG_HEADERS,
+            timeout=15.0,
+        )
+        if resp.status_code >= 300:
+            logger.warning(
+                "[partnership] soft POST %s failed [%s]: %s (continuing sweep)",
+                path, resp.status_code, resp.text[:200],
+            )
+            return False
+        return True
+    except Exception as e:
+        logger.warning("[partnership] soft POST %s raised: %r (continuing sweep)", path, e)
+        return False
+
+
 async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, Any]:
     """
     Finalize the partnership referenced by `match_id` on behalf of
@@ -185,7 +214,10 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
         # the sweep re-runs. Service-role client, so RLS on
         # notifications can't drop the cross-user writes.
         if not already_partnered_at:
-            await _pg_post(
+            # Soft — a CHECK constraint miss (migration 029 not applied)
+            # must NOT abort the sweep. Losing the celebration notif is
+            # far better than leaving stale side-matches lingering.
+            await _pg_post_soft(
                 client,
                 "notifications",
                 [
@@ -266,7 +298,10 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                     },
                 )
                 if not existing:
-                    await _pg_post(
+                    # Soft — CHECK constraint / RLS misconfig on this
+                    # single row must not abort the sweep for OTHER
+                    # third parties or the trailing steps.
+                    inserted_ok = await _pg_post_soft(
                         client,
                         "notifications",
                         {
@@ -281,7 +316,8 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                             "related_user_id": uid,
                         },
                     )
-                    third_parties_notified.add(third_party)
+                    if inserted_ok:
+                        third_parties_notified.add(third_party)
 
         # ---- 4. DELETE every match_requests row involving either partner ----
         # ALL statuses — pending, accepted, declined, expired. The
