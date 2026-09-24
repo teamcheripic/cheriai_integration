@@ -152,60 +152,61 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
 
         partner_ids = [m["user_a_id"], m["user_b_id"]]
 
-        # ---- Idempotent short-circuit ----
-        if m.get("partnered_at"):
-            logger.info("[partnership] already finalized match=%s — no-op", match_id)
-            return {
-                "match_id": match_id,
-                "partnered_at": m["partnered_at"],
-                "already_finalized": True,
-                "side_matches_deactivated": 0,
-                "third_parties_notified": 0,
-                "views_deleted": 0,
-                "requests_declined": 0,
-            }
-
+        # ---- Stamp partnered_at only if not already set ----
+        # Prior versions of this file short-circuited the ENTIRE sweep
+        # when partnered_at was already set. That created a footgun:
+        # if the sweep partially succeeded (e.g. because the migration
+        # 026/029 changes weren't deployed yet on an earlier attempt),
+        # historical side-matches / request rows / notifications
+        # LINGERED forever — user reported 2026-09-24 that Swaroop
+        # still saw Varsh in Connect long after partnering with Emma.
+        # New behavior: preserve the ORIGINAL partnered_at stamp
+        # (audit trail), but re-run every sweep step regardless. Every
+        # sweep step below is idempotent — deleting already-deleted
+        # rows and deactivating already-inactive rows are all no-ops —
+        # so calling finalize repeatedly for a partnered pair is safe
+        # and self-healing.
+        already_partnered_at = m.get("partnered_at")
         now_iso = datetime.now(timezone.utc).isoformat()
-
-        # ---- 2. Stamp partnered_at ----
-        await _pg_patch(
-            client,
-            "matches",
-            {"id": f"eq.{match_id}"},
-            {"partnered_at": now_iso},
-        )
+        if not already_partnered_at:
+            await _pg_patch(
+                client,
+                "matches",
+                {"id": f"eq.{match_id}"},
+                {"partnered_at": now_iso},
+            )
+        stamped_at = already_partnered_at or now_iso
 
         # ---- 2b. Notify both partners that the partnership is now
-        # official. Neither side gets a `partnered` notification from
-        # any other path — the client-side realtime channel picks up
-        # the DB update, but users who weren't looking at the match
-        # screen at that moment would never learn. Insert one row per
-        # partner; each references the OTHER partner via
-        # related_user_id so the notification UI can render an avatar
-        # + route to the Red Room chat. Service-role client, so RLS
-        # on notifications can't drop the cross-user writes.
-        await _pg_post(
-            client,
-            "notifications",
-            [
-                {
-                    "user_id": partner_ids[0],
-                    "type": "partnered",
-                    "title": "You made it official 💞",
-                    "body": "New introductions are paused while you focus on each other.",
-                    "related_user_id": partner_ids[1],
-                    "related_id": match_id,
-                },
-                {
-                    "user_id": partner_ids[1],
-                    "type": "partnered",
-                    "title": "You made it official 💞",
-                    "body": "New introductions are paused while you focus on each other.",
-                    "related_user_id": partner_ids[0],
-                    "related_id": match_id,
-                },
-            ],
-        )
+        # official. Only fires when we STAMPED partnered_at just now
+        # (first-time finalize) — a self-heal re-run against an
+        # already-partnered pair skips this, so users don't get
+        # duplicate "You made it official" notifications every time
+        # the sweep re-runs. Service-role client, so RLS on
+        # notifications can't drop the cross-user writes.
+        if not already_partnered_at:
+            await _pg_post(
+                client,
+                "notifications",
+                [
+                    {
+                        "user_id": partner_ids[0],
+                        "type": "partnered",
+                        "title": "You made it official 💞",
+                        "body": "New introductions are paused while you focus on each other.",
+                        "related_user_id": partner_ids[1],
+                        "related_id": match_id,
+                    },
+                    {
+                        "user_id": partner_ids[1],
+                        "type": "partnered",
+                        "title": "You made it official 💞",
+                        "body": "New introductions are paused while you focus on each other.",
+                        "related_user_id": partner_ids[0],
+                        "related_id": match_id,
+                    },
+                ],
+            )
 
         # ---- 3. Sweep side matches for both partners ----
         side_matches_deactivated = 0
@@ -386,8 +387,8 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
 
         return {
             "match_id": match_id,
-            "partnered_at": now_iso,
-            "already_finalized": False,
+            "partnered_at": stamped_at,
+            "already_finalized": bool(already_partnered_at),
             "side_matches_deactivated": side_matches_deactivated,
             "third_parties_notified": len(third_parties_notified),
             "requests_deleted": requests_deleted,
