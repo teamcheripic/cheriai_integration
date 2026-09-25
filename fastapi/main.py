@@ -554,35 +554,63 @@ async def matching_notify_interest_received(
                 )
                 return {"ok": True, "skipped": "no_pending_row"}
 
-            # Insert the in-app notification (service key bypasses RLS).
-            # Best-effort — a failure to insert doesn't block the email.
-            notif_resp = await client.post(
+            # Dedup — if an interest_received notification from THIS
+            # sender to THIS receiver already exists (from a pre-existing
+            # DB trigger, or a repeat call from the client), skip
+            # inserting another one. Reported bug 2026-09-25: users saw
+            # notifications duplicated because both a legacy trigger AND
+            # this endpoint were creating rows. Only checks UNREAD rows
+            # so a re-send after the receiver reads still surfaces
+            # cleanly.
+            existing_notif = await client.get(
                 f"{SUPABASE_URL}/rest/v1/notifications",
-                json={
-                    "user_id": req.receiver_user_id,
-                    "type": "interest_received",
-                    "title": "Someone is interested in you",
-                    "body": "Open your requests to see who — and decide whether to accept.",
-                    # related_user_id lets the partnership-finalize sweep
-                    # (partnership.py step 7) identify and delete this
-                    # notification when the SENDER later partners with
-                    # someone else. Without this, third parties would
-                    # still see "User A is interested in you" after A
-                    # partnered up. Same convention as partner_dropped.
-                    "related_user_id": caller_user_id,
+                params={
+                    "select": "id",
+                    "user_id": f"eq.{req.receiver_user_id}",
+                    "type": "eq.interest_received",
+                    "related_user_id": f"eq.{caller_user_id}",
+                    "read_at": "is.null",
+                    "limit": "1",
                 },
                 headers={
                     "apikey": SUPABASE_KEY,
                     "Authorization": f"Bearer {SUPABASE_KEY}",
-                    "Content-Type": "application/json",
-                    "Prefer": "return=minimal",
                 },
             )
-            if notif_resp.status_code >= 300:
-                logger.warning(
-                    "[interest-received] notification insert failed [%s]: %s",
-                    notif_resp.status_code, notif_resp.text[:200],
+            if existing_notif.status_code < 300 and existing_notif.json():
+                logger.info(
+                    "[interest-received] skipped duplicate: unread notif already exists sender=%s receiver=%s",
+                    caller_user_id, req.receiver_user_id,
                 )
+            else:
+                # Insert the in-app notification (service key bypasses RLS).
+                # related_user_id lets the partnership-finalize sweep
+                # (partnership.py step 7) identify and delete this
+                # notification when the SENDER later partners with
+                # someone else. Without this, third parties would
+                # still see "User A is interested in you" after A
+                # partnered up. Same convention as partner_dropped.
+                notif_resp = await client.post(
+                    f"{SUPABASE_URL}/rest/v1/notifications",
+                    json={
+                        "user_id": req.receiver_user_id,
+                        "type": "interest_received",
+                        "title": "Someone is interested in you",
+                        "body": "Open your requests to see who — and decide whether to accept.",
+                        "related_user_id": caller_user_id,
+                    },
+                    headers={
+                        "apikey": SUPABASE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "return=minimal",
+                    },
+                )
+                if notif_resp.status_code >= 300:
+                    logger.warning(
+                        "[interest-received] notification insert failed [%s]: %s",
+                        notif_resp.status_code, notif_resp.text[:200],
+                    )
 
         # Send the email. dedup=2h so 5 senders in 90 min → 1 email.
         # send_transactional_email never raises; it returns False on
