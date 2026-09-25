@@ -236,6 +236,12 @@ async def lifespan(app: FastAPI):
 
         # UTC-anchored so the daily job doesn't drift on DST-observing hosts.
         scheduler = AsyncIOScheduler(timezone="UTC")
+        # Local memory of what crontab we scheduled the daily job with,
+        # so a supervisor tick can detect a change and reschedule.
+        # APScheduler Job objects don't allow arbitrary attribute
+        # assignment (reported AttributeError 2026-09-25), so we keep
+        # the mapping in a closure-local variable instead.
+        current_daily_cron: dict[str, str] = {}
 
         async def _reconcile_daily_nudge() -> None:
             try:
@@ -245,10 +251,11 @@ async def lifespan(app: FastAPI):
                 if not enabled:
                     if job:
                         scheduler.remove_job("daily_match_nudge")
+                        current_daily_cron.pop("expr", None)
                         logger.info("Daily email cron DISARMED (admin toggle off).")
                     return
                 # enabled — decide add vs. reschedule vs. leave alone
-                current = getattr(job, "_cheripic_cron", None) if job else None
+                current = current_daily_cron.get("expr")
                 if job is None:
                     scheduler.add_job(
                         run_daily_email_cron,
@@ -258,14 +265,14 @@ async def lifespan(app: FastAPI):
                         coalesce=True,
                         misfire_grace_time=3600,
                     )
-                    scheduler.get_job("daily_match_nudge")._cheripic_cron = wanted
+                    current_daily_cron["expr"] = wanted
                     logger.info("Daily email cron ARMED (UTC crontab: '%s').", wanted)
                 elif current != wanted:
                     scheduler.reschedule_job(
                         "daily_match_nudge",
                         trigger=CronTrigger.from_crontab(wanted, timezone="UTC"),
                     )
-                    scheduler.get_job("daily_match_nudge")._cheripic_cron = wanted
+                    current_daily_cron["expr"] = wanted
                     logger.info("Daily email cron RESCHEDULED (UTC crontab: '%s').", wanted)
             except Exception as e:
                 logger.error("Cron supervisor tick failed: %r", e, exc_info=True)
