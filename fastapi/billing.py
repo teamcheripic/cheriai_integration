@@ -173,8 +173,45 @@ TIER_FROM_PRICE_CACHE: dict[str, str] = {}
 
 
 def _register_price_to_tier_mapping(mapping: dict[str, str]) -> None:
-    """Called from main.py at startup with the mapping from membership.ts."""
+    """Called from main.py at startup with the mapping from membership.ts
+    (hardcoded fallback). DB-sourced entries are layered on top by
+    refresh_price_to_tier_from_db() so admin edits in the panel take
+    effect without a redeploy."""
     TIER_FROM_PRICE_CACHE.update(mapping)
+
+
+async def refresh_price_to_tier_from_db() -> None:
+    """
+    Merge the DB-sourced stripe_price_id → tier mapping from
+    tier_config into TIER_FROM_PRICE_CACHE. Called at startup AND at
+    the top of every webhook so a Stripe price rotation edited in the
+    admin panel is respected on the very next webhook — no Railway
+    redeploy needed. Hardcoded placeholders from membership.ts stay
+    in the map as a fallback so a bad DB row can't blank the mapping.
+    """
+    try:
+        rows = await supabase.select(
+            "tier_config",
+            columns="tier,stripe_price_id",
+        )
+    except Exception as e:
+        logger.warning("[billing] refresh_price_to_tier_from_db failed: %s", e)
+        return
+    added = 0
+    for r in rows or []:
+        pid = r.get("stripe_price_id")
+        tier = r.get("tier")
+        # Skip nulls + placeholder values ('price_REPLACE_...') so a
+        # partially-populated tier_config row doesn't shadow a real
+        # env/hardcoded mapping.
+        if not pid or not tier or "REPLACE" in pid or not pid.startswith("price_"):
+            continue
+        TIER_FROM_PRICE_CACHE[pid] = tier
+        added += 1
+    logger.info(
+        "[billing] price→tier cache: %d entries (%d from DB)",
+        len(TIER_FROM_PRICE_CACHE), added,
+    )
 
 
 def _tier_for_price(price_id: Optional[str]) -> Optional[str]:
@@ -262,6 +299,12 @@ async def _upsert_active_membership(
 
 async def handle_event(payload: bytes, signature: str) -> dict:
     """Validate + dispatch a Stripe webhook payload. Returns a summary dict."""
+    # Refresh the price→tier cache from tier_config on every webhook so
+    # a Stripe price rotation edited in the admin panel takes effect
+    # immediately. Best-effort; a failure leaves the previous cache in
+    # place so we don't lose the ability to identify existing prices.
+    await refresh_price_to_tier_from_db()
+
     stripe = _get_stripe()
     secret = get_webhook_secret()
 

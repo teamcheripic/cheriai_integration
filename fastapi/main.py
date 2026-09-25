@@ -202,7 +202,15 @@ async def lifespan(app: FastAPI):
     # Pass the Stripe price → tier mapping to the billing module so the
     # webhook handler knows which tier to grant for each price_id.
     billing._register_price_to_tier_mapping(STRIPE_PRICE_TO_TIER)
-    logger.info("Stripe price→tier map loaded (%d entries)", len(STRIPE_PRICE_TO_TIER))
+    logger.info("Stripe price→tier map loaded (%d entries from code)", len(STRIPE_PRICE_TO_TIER))
+    # Merge DB-sourced price IDs (tier_config.stripe_price_id) — this is
+    # what the admin panel edits (migration 027). Without this step,
+    # every checkout with a real Stripe price id gets mapped to None
+    # by the webhook and no tier upgrade happens.
+    try:
+        await billing.refresh_price_to_tier_from_db()
+    except Exception as e:
+        logger.warning("Could not load tier_config price IDs at startup (%r); using hardcoded fallback", e)
     # Warm the limits cache and log what's actually in force, so a missing
     # table or a bad row in cheri_ai_tier_limits is obvious in the deploy log
     # rather than surfacing later as a surprising quota.
