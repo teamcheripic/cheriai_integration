@@ -17,7 +17,7 @@ Run:
 import os
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional, List
 from contextlib import asynccontextmanager
 import asyncio
@@ -475,6 +475,143 @@ class AdminTriggerEmailRequest(BaseModel):
     template_slug: str
     extra_vars: Optional[dict] = None
     dedup_window_hours: int = 1
+
+
+@app.post("/admin/wipe-relationships", tags=["Admin"])
+async def admin_wipe_relationships(
+    admin_user_id: str = Depends(get_current_admin_id),
+):
+    """
+    One-click reset of every relationship artifact on the platform.
+
+    Runs from the admin panel's System page. Uses the service key
+    (bypasses RLS) so we don't need an SQL migration; the admin JWT
+    is verified by get_current_admin_id BEFORE any delete runs, so
+    a non-admin call is rejected with 403 at the FastAPI layer.
+
+    DELETES (in FK-safe order):
+      • public.match_reads
+      • public.match_messages
+      • public.matches
+      • public.match_requests
+      • public.user_match_views
+      • public.notifications where type ∈ matching-flow set
+
+    KEEPS: user_profiles, user_memberships, cheri_ai_*, blocked_users,
+    stripe_events, sent_emails, and every admin/merchant/vendor table.
+    """
+    logger.info("[admin-wipe-relationships] admin=%s", admin_user_id)
+
+    # PostgREST supports DELETE with filter params. For each table we
+    # send `select=id&limit=<huge>` semantics via a broad `neq` on a
+    # column that's always non-null (id), which satisfies its
+    # "reject unfiltered DELETE" default while wiping every row.
+    matching_types = (
+        "interest_received",
+        "interest_accepted",
+        "match_created",
+        "match_available",
+        "match_accepted",
+        "match_declined",
+        "match_expired",
+        "new_match",
+        "partner_proposal",
+        "partner_dropped",
+        "partnered",
+        "unmatched",
+    )
+
+    counts: dict[str, int] = {
+        "match_reads": 0,
+        "match_messages": 0,
+        "matches": 0,
+        "match_requests": 0,
+        "user_match_views": 0,
+        "notifications": 0,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Prefer": "return=representation, count=exact",
+        }
+
+        async def wipe(table: str, extra_filter: str = "") -> int:
+            """DELETE every row (or rows matching extra_filter) from a
+            PostgREST-exposed table. Returns rowcount from the
+            Content-Range header. `id=neq.00000000-0000-0000-0000-000000000000`
+            satisfies PostgREST's safety net; every real row has a
+            different UUID so it's a whole-table wipe."""
+            url = f"{SUPABASE_URL}/rest/v1/{table}"
+            params = {"id": "neq.00000000-0000-0000-0000-000000000000"}
+            if extra_filter:
+                # extra_filter is "col=eq.value" form; split into k=v.
+                k, v = extra_filter.split("=", 1)
+                params[k] = v
+            resp = await client.delete(url, params=params, headers=headers)
+            if resp.status_code >= 300:
+                logger.error(
+                    "[admin-wipe-relationships] DELETE %s failed [%s]: %s",
+                    table, resp.status_code, resp.text[:200],
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"wipe_failed_{table}: {resp.text[:200]}",
+                )
+            # PostgREST returns the deleted rows in the body when
+            # Prefer=return=representation; count via json length.
+            try:
+                return len(resp.json())
+            except Exception:
+                return 0
+
+        # FK order: children first
+        counts["match_reads"] = await wipe("match_reads")
+        counts["match_messages"] = await wipe("match_messages")
+        counts["matches"] = await wipe("matches")
+        counts["match_requests"] = await wipe("match_requests")
+        # user_match_views uses (user_id, target_user_id) composite PK —
+        # no `id` column. Fall back to filtering on user_id (always
+        # non-null) instead of id.
+        {
+            # Skip the helper here; do the DELETE inline for clarity.
+        }
+        umv_url = f"{SUPABASE_URL}/rest/v1/user_match_views"
+        umv_resp = await client.delete(
+            umv_url,
+            params={"user_id": "neq.00000000-0000-0000-0000-000000000000"},
+            headers=headers,
+        )
+        if umv_resp.status_code >= 300:
+            raise HTTPException(
+                status_code=500,
+                detail=f"wipe_failed_user_match_views: {umv_resp.text[:200]}",
+            )
+        try:
+            counts["user_match_views"] = len(umv_resp.json())
+        except Exception:
+            counts["user_match_views"] = 0
+
+        # Notifications — narrow to matching-flow types only.
+        n_url = f"{SUPABASE_URL}/rest/v1/notifications"
+        n_resp = await client.delete(
+            n_url,
+            params={"type": f"in.({','.join(matching_types)})"},
+            headers=headers,
+        )
+        if n_resp.status_code >= 300:
+            raise HTTPException(
+                status_code=500,
+                detail=f"wipe_failed_notifications: {n_resp.text[:200]}",
+            )
+        try:
+            counts["notifications"] = len(n_resp.json())
+        except Exception:
+            counts["notifications"] = 0
+
+    logger.info("[admin-wipe-relationships] done: %r", counts)
+    return {"ok": True, **counts, "wiped_at": datetime.now(timezone.utc).isoformat()}
 
 
 @app.post("/admin/trigger-email", tags=["Admin"])
