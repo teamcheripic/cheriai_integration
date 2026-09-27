@@ -348,16 +348,27 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
         # Both directions: rows where the partner is the viewer AND rows
         # where the partner is the target. Frees third-party slots and
         # clears the Home stories strip.
+        #
+        # CRITICAL: preserve epoch-skip sentinels (shown_at < 1971-01-01).
+        # Those rows are the permanent "once-ex, always-blocked" markers
+        # written by unmatchUser / mark_permanent_skip. Reported
+        # 2026-09-27: Emma ↔ Sai broke up, epoch-skips written; Emma then
+        # partnered with Bannu; THIS sweep nuked the Emma↔Sai sentinels
+        # because they involved Emma — Sai reappeared in Emma's Discover
+        # after her next unmatch. Fix: filter shown_at >= 1971-01-01 so
+        # only the normal "recently-shown" rows get cleared, and the
+        # epoch sentinels survive every subsequent partnership.
+        _NON_EPOCH = "gte.1971-01-01T00:00:00Z"
         for uid in partner_ids:
             await _pg_delete(
                 client,
                 "user_match_views",
-                {"user_id": f"eq.{uid}"},
+                {"user_id": f"eq.{uid}", "shown_at": _NON_EPOCH},
             )
             await _pg_delete(
                 client,
                 "user_match_views",
-                {"target_user_id": f"eq.{uid}"},
+                {"target_user_id": f"eq.{uid}", "shown_at": _NON_EPOCH},
             )
 
         # ---- 6 & 7. Notification sweep ----
