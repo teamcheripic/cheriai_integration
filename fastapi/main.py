@@ -482,7 +482,18 @@ async def admin_wipe_relationships(
     admin_user_id: str = Depends(get_current_admin_id),
 ):
     """
-    One-click reset of every relationship artifact on the platform.
+    One-click reset of every ACTIVE relationship artifact on the
+    platform — BUT preserves permanent-block markers between any pair
+    who was ever in a real relationship. Reported 2026-09-27: after
+    the wipe, ex-partners re-appeared in each other's Discover
+    because the wipe destroyed the isolation markers along with the
+    active state. Product intent is "once ex, always blocked" — so
+    the wipe now:
+       1. Reads every pair from matches + match_requests(accepted)
+       2. Deletes all active state
+       3. Re-INSERTs epoch-skip rows for each ex-pair (both directions)
+    After this, users can start fresh interactions with strangers
+    while their historical exes stay permanently hidden.
 
     Runs from the admin panel's System page. Uses the service key
     (bypasses RLS) so we don't need an SQL migration; the admin JWT
@@ -496,6 +507,11 @@ async def admin_wipe_relationships(
       • public.match_requests
       • public.user_match_views
       • public.notifications where type ∈ matching-flow set
+
+    PRESERVES via re-insertion:
+      • Epoch-skip rows in user_match_views for every ex-pair.
+        (getPastMatchPeerIds also reads matches — but those are now
+        gone — so this is the primary evidence trail.)
 
     KEEPS: user_profiles, user_memberships, cheri_ai_*, blocked_users,
     stripe_events, sent_emails, and every admin/merchant/vendor table.
@@ -550,7 +566,47 @@ async def admin_wipe_relationships(
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "Prefer": "return=representation, count=exact",
         }
+        read_headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+        }
 
+        # === STEP 1 — collect every ex-pair BEFORE wiping ===============
+        # Two evidence sources — matches (any state, active or inactive)
+        # and match_requests with status='accepted'. Union both into a
+        # set of (u1, u2) tuples (normalised so u1 < u2 stringwise, to
+        # dedupe A-B vs B-A). These are the pairs whose permanent-block
+        # markers must survive the wipe.
+        ex_pairs: set[tuple[str, str]] = set()
+
+        def add_pair(a: str, b: str) -> None:
+            if not a or not b or a == b:
+                return
+            ex_pairs.add((a, b) if a < b else (b, a))
+
+        # Every matches row (active + inactive)
+        m_resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/matches",
+            params={"select": "user_a_id,user_b_id"},
+            headers=read_headers,
+        )
+        if m_resp.status_code < 300:
+            for row in m_resp.json() or []:
+                add_pair(row.get("user_a_id"), row.get("user_b_id"))
+
+        # Every accepted match_request
+        r_resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/match_requests",
+            params={"select": "sender_id,receiver_id", "status": "eq.accepted"},
+            headers=read_headers,
+        )
+        if r_resp.status_code < 300:
+            for row in r_resp.json() or []:
+                add_pair(row.get("sender_id"), row.get("receiver_id"))
+
+        logger.info("[admin-wipe-relationships] preserving %d ex-pairs", len(ex_pairs))
+
+        # === STEP 2 — do the wipe (existing logic) ======================
         for table, col in WIPE_TARGETS:
             url = f"{SUPABASE_URL}/rest/v1/{table}"
             resp = await client.delete(
@@ -590,6 +646,45 @@ async def admin_wipe_relationships(
         except Exception:
             counts["notifications"] = 0
 
+        # === STEP 3 — re-insert epoch-skip rows for every ex-pair =======
+        # Both directions, so BOTH sides' getPermanentlySkippedUserIds
+        # picks up the other. shown_at at epoch (1970-01-01) is the
+        # sentinel value the frontend filters treat as "never show".
+        # Chunk the insert in batches of 500 rows to stay under
+        # PostgREST's request-size limit for very large deployments.
+        preserved = 0
+        if ex_pairs:
+            EPOCH_ISO = "1970-01-01T00:00:00+00:00"
+            skip_rows: list[dict[str, Any]] = []
+            for u1, u2 in ex_pairs:
+                skip_rows.append({"user_id": u1, "target_user_id": u2, "shown_at": EPOCH_ISO})
+                skip_rows.append({"user_id": u2, "target_user_id": u1, "shown_at": EPOCH_ISO})
+
+            CHUNK = 500
+            for i in range(0, len(skip_rows), CHUNK):
+                batch = skip_rows[i : i + CHUNK]
+                ins_resp = await client.post(
+                    f"{SUPABASE_URL}/rest/v1/user_match_views",
+                    params={"on_conflict": "user_id,target_user_id"},
+                    json=batch,
+                    headers={
+                        **headers,
+                        "Prefer": "resolution=merge-duplicates, return=minimal",
+                    },
+                )
+                if ins_resp.status_code >= 300:
+                    logger.error(
+                        "[admin-wipe-relationships] preserve batch %d failed [%s]: %s",
+                        i // CHUNK, ins_resp.status_code, ins_resp.text[:200],
+                    )
+                    # Non-fatal — the wipe already succeeded; the missing
+                    # preserves reduce isolation coverage but don't
+                    # corrupt anything. Continue with remaining batches.
+                else:
+                    preserved += len(batch)
+
+    counts["ex_pairs_preserved"] = len(ex_pairs)
+    counts["skip_rows_written"] = preserved
     logger.info("[admin-wipe-relationships] done: %r", counts)
     return {"ok": True, **counts, "wiped_at": datetime.now(timezone.utc).isoformat()}
 
