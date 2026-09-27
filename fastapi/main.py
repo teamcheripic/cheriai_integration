@@ -482,18 +482,19 @@ async def admin_wipe_relationships(
     admin_user_id: str = Depends(get_current_admin_id),
 ):
     """
-    One-click reset of every ACTIVE relationship artifact on the
-    platform — BUT preserves permanent-block markers between any pair
-    who was ever in a real relationship. Reported 2026-09-27: after
-    the wipe, ex-partners re-appeared in each other's Discover
-    because the wipe destroyed the isolation markers along with the
-    active state. Product intent is "once ex, always blocked" — so
-    the wipe now:
-       1. Reads every pair from matches + match_requests(accepted)
-       2. Deletes all active state
-       3. Re-INSERTs epoch-skip rows for each ex-pair (both directions)
-    After this, users can start fresh interactions with strangers
-    while their historical exes stay permanently hidden.
+    TRUE CLEAN-SLATE reset for admin QA / dev testing. Deletes every
+    relationship artifact so every user can re-discover every other
+    user — no historical exes remain blocked. This is NOT a
+    production flow; in production, isolation is enforced by
+    unmatchUser + partnership sweep (they preserve matches rows as
+    is_active=false and write epoch skips, and neither ever deletes a
+    matches row).
+
+    Reported 2026-09-27: earlier "preserve" version produced
+    inconsistent behavior between test cycles — some pairs' evidence
+    survived (Varsh↔Bannu matches row) while others' was destroyed
+    (Emma↔Sai orphaned epoch skips). The admin button needs to be
+    predictable: wipe means WIPE.
 
     Runs from the admin panel's System page. Uses the service key
     (bypasses RLS) so we don't need an SQL migration; the admin JWT
@@ -503,18 +504,18 @@ async def admin_wipe_relationships(
     DELETES (in FK-safe order):
       • public.match_reads
       • public.match_messages
-      • public.matches
+      • public.matches                    (HARD DELETE — evidence gone)
       • public.match_requests
-      • public.user_match_views
+      • public.user_match_views           (both recent + epoch sentinels)
       • public.notifications where type ∈ matching-flow set
-
-    PRESERVES via re-insertion:
-      • Epoch-skip rows in user_match_views for every ex-pair.
-        (getPastMatchPeerIds also reads matches — but those are now
-        gone — so this is the primary evidence trail.)
 
     KEEPS: user_profiles, user_memberships, cheri_ai_*, blocked_users,
     stripe_events, sent_emails, and every admin/merchant/vendor table.
+
+    After wipe: every user's Discover is a completely fresh pool. If
+    an admin needs to test isolation, they run the full flow (match →
+    partner → break up) and verify the ex stays hidden — the isolation
+    code path itself never touches this endpoint.
     """
     logger.info("[admin-wipe-relationships] admin=%s", admin_user_id)
 
@@ -540,34 +541,32 @@ async def admin_wipe_relationships(
     counts: dict[str, int] = {
         "match_reads": 0,
         "match_messages": 0,
-        "matches_soft_deleted": 0,
+        "matches": 0,
         "match_requests": 0,
         "user_match_views": 0,
         "notifications": 0,
     }
 
-    # Each table's PostgREST DELETE needs a filter (otherwise 21000
-    # "DELETE requires a WHERE clause"). Not every table has an `id`
-    # column — match_reads and user_match_views are composite-PK.
-    # Match each table to a column that always exists AND is
-    # always non-null. `not.is.null` returns every row.
-    #
-    # NOTE: `matches` is DELIBERATELY OMITTED from this list. Product
-    # spec is "once ex, always ex, no re-dating" — the matches row is
-    # the authoritative evidence trail that two users had a real
-    # connection. Deleting it destroyed getPastMatchPeerIds's
-    # belt-and-braces isolation signal, and combined with any
-    # partnership sweep that also nuked epoch-skips, ex-partners
-    # resurfaced in each other's Discover (reported 2026-09-27).
-    # Instead, matches is SOFT-DELETED further below: PATCH is_active=
-    # false, partnered_at=null, partner_accepted_by_a/b=false. The row
-    # stays as the "you two were connected" marker for eternity.
+    # Admin wipe = TRUE CLEAN SLATE for testing. Deletes every
+    # relationship artifact including matches rows and epoch-skip
+    # sentinels, so every user can re-discover every other user
+    # again. Reported 2026-09-27: with soft-delete + preserve, an
+    # earlier wipe destroyed some pairs' evidence (Emma-Sai) but
+    # preserved others' (Varsh-Bannu), producing inconsistent Discover
+    # state where Emma saw Sai but Varsh could not see Bannu.
+    # Product intent for THIS button is admin QA reset, not a
+    # production flow. In production nobody hits this endpoint, and
+    # the "once ex, always ex" rule is enforced by unmatchUser +
+    # partnership sweep — those preserve the matches row as
+    # is_active=false and write epoch skips, and neither the sweep
+    # nor unmatch ever deletes matches rows.
     WIPE_TARGETS: list[tuple[str, str]] = [
         # (table_name, filter_column) — filter col must be non-null on every row
         ("match_reads",       "match_id"),        # composite PK (match_id, user_id)
         ("match_messages",    "id"),
+        ("matches",           "id"),              # HARD-delete for true reset
         ("match_requests",    "id"),
-        ("user_match_views",  "user_id"),         # composite PK (user_id, target_user_id)
+        ("user_match_views",  "user_id"),         # composite PK (user_id, target_user_id) — includes epoch sentinels
     ]
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -581,62 +580,7 @@ async def admin_wipe_relationships(
             "Authorization": f"Bearer {SUPABASE_KEY}",
         }
 
-        # === STEP 1 — collect every ex-pair BEFORE wiping ===============
-        # Two evidence sources — matches (any state, active or inactive)
-        # and match_requests with status='accepted'. Union both into a
-        # set of (u1, u2) tuples (normalised so u1 < u2 stringwise, to
-        # dedupe A-B vs B-A). These are the pairs whose permanent-block
-        # markers must survive the wipe.
-        ex_pairs: set[tuple[str, str]] = set()
-
-        def add_pair(a: str, b: str) -> None:
-            if not a or not b or a == b:
-                return
-            ex_pairs.add((a, b) if a < b else (b, a))
-
-        # Every matches row (active + inactive)
-        m_resp = await client.get(
-            f"{SUPABASE_URL}/rest/v1/matches",
-            params={"select": "user_a_id,user_b_id"},
-            headers=read_headers,
-        )
-        if m_resp.status_code < 300:
-            for row in m_resp.json() or []:
-                add_pair(row.get("user_a_id"), row.get("user_b_id"))
-
-        # Every accepted match_request
-        r_resp = await client.get(
-            f"{SUPABASE_URL}/rest/v1/match_requests",
-            params={"select": "sender_id,receiver_id", "status": "eq.accepted"},
-            headers=read_headers,
-        )
-        if r_resp.status_code < 300:
-            for row in r_resp.json() or []:
-                add_pair(row.get("sender_id"), row.get("receiver_id"))
-
-        # Every EXISTING epoch-skip pair (shown_at < 1971-01-01).
-        # Critical: an epoch skip may exist for a pair whose matches
-        # row was hard-deleted by a prior wipe cycle (before the
-        # soft-delete fix). Without this read, STEP 3 preserve would
-        # miss those pairs and the wipe would destroy the last
-        # remaining evidence of the historical relationship.
-        # Reported 2026-09-27: Sai↔Emma had bidirectional epoch skips
-        # (no matches row); the wipe destroyed them because
-        # matches/requests didn't seed the ex_pair for that pair.
-        # Fix: include existing epoch skips in ex_pairs so they
-        # survive every subsequent wipe.
-        v_resp = await client.get(
-            f"{SUPABASE_URL}/rest/v1/user_match_views",
-            params={"select": "user_id,target_user_id", "shown_at": "lt.1971-01-01T00:00:00Z"},
-            headers=read_headers,
-        )
-        if v_resp.status_code < 300:
-            for row in v_resp.json() or []:
-                add_pair(row.get("user_id"), row.get("target_user_id"))
-
-        logger.info("[admin-wipe-relationships] preserving %d ex-pairs", len(ex_pairs))
-
-        # === STEP 2 — do the wipe (existing logic) ======================
+        # === Wipe every relationship artifact (TRUE clean slate) ========
         for table, col in WIPE_TARGETS:
             url = f"{SUPABASE_URL}/rest/v1/{table}"
             resp = await client.delete(
@@ -658,41 +602,6 @@ async def admin_wipe_relationships(
             except Exception:
                 counts[table] = 0
 
-        # === STEP 2b — SOFT-DELETE matches (do NOT DELETE the row) ===
-        # See the WIPE_TARGETS comment: matches is the authoritative
-        # ex-history evidence trail that powers getPastMatchPeerIds.
-        # We PATCH every row to look "ended" (is_active=false,
-        # partnered_at=null, both partner-acceptance flags cleared) so
-        # Discover / Connect / Interests all read them as ex-connections
-        # to keep hidden — even if the epoch-skip rows in
-        # user_match_views ever get corrupted or a partnership sweep
-        # accidentally nukes them. The row itself lives forever.
-        m_patch_url = f"{SUPABASE_URL}/rest/v1/matches"
-        m_patch_resp = await client.patch(
-            m_patch_url,
-            params={"id": "not.is.null"},
-            json={
-                "is_active": False,
-                "partnered_at": None,
-                "partner_accepted_by_a": False,
-                "partner_accepted_by_b": False,
-            },
-            headers=headers,
-        )
-        if m_patch_resp.status_code >= 300:
-            logger.error(
-                "[admin-wipe-relationships] PATCH matches failed [%s]: %s",
-                m_patch_resp.status_code, m_patch_resp.text[:200],
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=f"wipe_soft_delete_matches_failed: {m_patch_resp.text[:200]}",
-            )
-        try:
-            counts["matches_soft_deleted"] = len(m_patch_resp.json())
-        except Exception:
-            counts["matches_soft_deleted"] = 0
-
         # Notifications — narrow to matching-flow types only (real filter,
         # not "delete everything").
         n_url = f"{SUPABASE_URL}/rest/v1/notifications"
@@ -711,45 +620,6 @@ async def admin_wipe_relationships(
         except Exception:
             counts["notifications"] = 0
 
-        # === STEP 3 — re-insert epoch-skip rows for every ex-pair =======
-        # Both directions, so BOTH sides' getPermanentlySkippedUserIds
-        # picks up the other. shown_at at epoch (1970-01-01) is the
-        # sentinel value the frontend filters treat as "never show".
-        # Chunk the insert in batches of 500 rows to stay under
-        # PostgREST's request-size limit for very large deployments.
-        preserved = 0
-        if ex_pairs:
-            EPOCH_ISO = "1970-01-01T00:00:00+00:00"
-            skip_rows: list[dict[str, Any]] = []
-            for u1, u2 in ex_pairs:
-                skip_rows.append({"user_id": u1, "target_user_id": u2, "shown_at": EPOCH_ISO})
-                skip_rows.append({"user_id": u2, "target_user_id": u1, "shown_at": EPOCH_ISO})
-
-            CHUNK = 500
-            for i in range(0, len(skip_rows), CHUNK):
-                batch = skip_rows[i : i + CHUNK]
-                ins_resp = await client.post(
-                    f"{SUPABASE_URL}/rest/v1/user_match_views",
-                    params={"on_conflict": "user_id,target_user_id"},
-                    json=batch,
-                    headers={
-                        **headers,
-                        "Prefer": "resolution=merge-duplicates, return=minimal",
-                    },
-                )
-                if ins_resp.status_code >= 300:
-                    logger.error(
-                        "[admin-wipe-relationships] preserve batch %d failed [%s]: %s",
-                        i // CHUNK, ins_resp.status_code, ins_resp.text[:200],
-                    )
-                    # Non-fatal — the wipe already succeeded; the missing
-                    # preserves reduce isolation coverage but don't
-                    # corrupt anything. Continue with remaining batches.
-                else:
-                    preserved += len(batch)
-
-    counts["ex_pairs_preserved"] = len(ex_pairs)
-    counts["skip_rows_written"] = preserved
     logger.info("[admin-wipe-relationships] done: %r", counts)
     return {"ok": True, **counts, "wiped_at": datetime.now(timezone.utc).isoformat()}
 
