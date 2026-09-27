@@ -530,6 +530,20 @@ async def admin_wipe_relationships(
         "notifications": 0,
     }
 
+    # Each table's PostgREST DELETE needs a filter (otherwise 21000
+    # "DELETE requires a WHERE clause"). Not every table has an `id`
+    # column — match_reads and user_match_views are composite-PK.
+    # Match each table to a column that always exists AND is
+    # always non-null. `not.is.null` returns every row.
+    WIPE_TARGETS: list[tuple[str, str]] = [
+        # (table_name, filter_column) — filter col must be non-null on every row
+        ("match_reads",       "match_id"),        # composite PK (match_id, user_id)
+        ("match_messages",    "id"),
+        ("matches",           "id"),
+        ("match_requests",    "id"),
+        ("user_match_views",  "user_id"),         # composite PK (user_id, target_user_id)
+    ]
+
     async with httpx.AsyncClient(timeout=60.0) as client:
         headers = {
             "apikey": SUPABASE_KEY,
@@ -537,19 +551,13 @@ async def admin_wipe_relationships(
             "Prefer": "return=representation, count=exact",
         }
 
-        async def wipe(table: str, extra_filter: str = "") -> int:
-            """DELETE every row (or rows matching extra_filter) from a
-            PostgREST-exposed table. Returns rowcount from the
-            Content-Range header. `id=neq.00000000-0000-0000-0000-000000000000`
-            satisfies PostgREST's safety net; every real row has a
-            different UUID so it's a whole-table wipe."""
+        for table, col in WIPE_TARGETS:
             url = f"{SUPABASE_URL}/rest/v1/{table}"
-            params = {"id": "neq.00000000-0000-0000-0000-000000000000"}
-            if extra_filter:
-                # extra_filter is "col=eq.value" form; split into k=v.
-                k, v = extra_filter.split("=", 1)
-                params[k] = v
-            resp = await client.delete(url, params=params, headers=headers)
+            resp = await client.delete(
+                url,
+                params={col: "not.is.null"},
+                headers=headers,
+            )
             if resp.status_code >= 300:
                 logger.error(
                     "[admin-wipe-relationships] DELETE %s failed [%s]: %s",
@@ -559,41 +567,13 @@ async def admin_wipe_relationships(
                     status_code=500,
                     detail=f"wipe_failed_{table}: {resp.text[:200]}",
                 )
-            # PostgREST returns the deleted rows in the body when
-            # Prefer=return=representation; count via json length.
             try:
-                return len(resp.json())
+                counts[table] = len(resp.json())
             except Exception:
-                return 0
+                counts[table] = 0
 
-        # FK order: children first
-        counts["match_reads"] = await wipe("match_reads")
-        counts["match_messages"] = await wipe("match_messages")
-        counts["matches"] = await wipe("matches")
-        counts["match_requests"] = await wipe("match_requests")
-        # user_match_views uses (user_id, target_user_id) composite PK —
-        # no `id` column. Fall back to filtering on user_id (always
-        # non-null) instead of id.
-        {
-            # Skip the helper here; do the DELETE inline for clarity.
-        }
-        umv_url = f"{SUPABASE_URL}/rest/v1/user_match_views"
-        umv_resp = await client.delete(
-            umv_url,
-            params={"user_id": "neq.00000000-0000-0000-0000-000000000000"},
-            headers=headers,
-        )
-        if umv_resp.status_code >= 300:
-            raise HTTPException(
-                status_code=500,
-                detail=f"wipe_failed_user_match_views: {umv_resp.text[:200]}",
-            )
-        try:
-            counts["user_match_views"] = len(umv_resp.json())
-        except Exception:
-            counts["user_match_views"] = 0
-
-        # Notifications — narrow to matching-flow types only.
+        # Notifications — narrow to matching-flow types only (real filter,
+        # not "delete everything").
         n_url = f"{SUPABASE_URL}/rest/v1/notifications"
         n_resp = await client.delete(
             n_url,
