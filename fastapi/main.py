@@ -540,7 +540,7 @@ async def admin_wipe_relationships(
     counts: dict[str, int] = {
         "match_reads": 0,
         "match_messages": 0,
-        "matches": 0,
+        "matches_soft_deleted": 0,
         "match_requests": 0,
         "user_match_views": 0,
         "notifications": 0,
@@ -551,11 +551,21 @@ async def admin_wipe_relationships(
     # column — match_reads and user_match_views are composite-PK.
     # Match each table to a column that always exists AND is
     # always non-null. `not.is.null` returns every row.
+    #
+    # NOTE: `matches` is DELIBERATELY OMITTED from this list. Product
+    # spec is "once ex, always ex, no re-dating" — the matches row is
+    # the authoritative evidence trail that two users had a real
+    # connection. Deleting it destroyed getPastMatchPeerIds's
+    # belt-and-braces isolation signal, and combined with any
+    # partnership sweep that also nuked epoch-skips, ex-partners
+    # resurfaced in each other's Discover (reported 2026-09-27).
+    # Instead, matches is SOFT-DELETED further below: PATCH is_active=
+    # false, partnered_at=null, partner_accepted_by_a/b=false. The row
+    # stays as the "you two were connected" marker for eternity.
     WIPE_TARGETS: list[tuple[str, str]] = [
         # (table_name, filter_column) — filter col must be non-null on every row
         ("match_reads",       "match_id"),        # composite PK (match_id, user_id)
         ("match_messages",    "id"),
-        ("matches",           "id"),
         ("match_requests",    "id"),
         ("user_match_views",  "user_id"),         # composite PK (user_id, target_user_id)
     ]
@@ -627,6 +637,41 @@ async def admin_wipe_relationships(
                 counts[table] = len(resp.json())
             except Exception:
                 counts[table] = 0
+
+        # === STEP 2b — SOFT-DELETE matches (do NOT DELETE the row) ===
+        # See the WIPE_TARGETS comment: matches is the authoritative
+        # ex-history evidence trail that powers getPastMatchPeerIds.
+        # We PATCH every row to look "ended" (is_active=false,
+        # partnered_at=null, both partner-acceptance flags cleared) so
+        # Discover / Connect / Interests all read them as ex-connections
+        # to keep hidden — even if the epoch-skip rows in
+        # user_match_views ever get corrupted or a partnership sweep
+        # accidentally nukes them. The row itself lives forever.
+        m_patch_url = f"{SUPABASE_URL}/rest/v1/matches"
+        m_patch_resp = await client.patch(
+            m_patch_url,
+            params={"id": "not.is.null"},
+            json={
+                "is_active": False,
+                "partnered_at": None,
+                "partner_accepted_by_a": False,
+                "partner_accepted_by_b": False,
+            },
+            headers=headers,
+        )
+        if m_patch_resp.status_code >= 300:
+            logger.error(
+                "[admin-wipe-relationships] PATCH matches failed [%s]: %s",
+                m_patch_resp.status_code, m_patch_resp.text[:200],
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"wipe_soft_delete_matches_failed: {m_patch_resp.text[:200]}",
+            )
+        try:
+            counts["matches_soft_deleted"] = len(m_patch_resp.json())
+        except Exception:
+            counts["matches_soft_deleted"] = 0
 
         # Notifications — narrow to matching-flow types only (real filter,
         # not "delete everything").
