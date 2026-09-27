@@ -614,6 +614,26 @@ async def admin_wipe_relationships(
             for row in r_resp.json() or []:
                 add_pair(row.get("sender_id"), row.get("receiver_id"))
 
+        # Every EXISTING epoch-skip pair (shown_at < 1971-01-01).
+        # Critical: an epoch skip may exist for a pair whose matches
+        # row was hard-deleted by a prior wipe cycle (before the
+        # soft-delete fix). Without this read, STEP 3 preserve would
+        # miss those pairs and the wipe would destroy the last
+        # remaining evidence of the historical relationship.
+        # Reported 2026-09-27: Sai↔Emma had bidirectional epoch skips
+        # (no matches row); the wipe destroyed them because
+        # matches/requests didn't seed the ex_pair for that pair.
+        # Fix: include existing epoch skips in ex_pairs so they
+        # survive every subsequent wipe.
+        v_resp = await client.get(
+            f"{SUPABASE_URL}/rest/v1/user_match_views",
+            params={"select": "user_id,target_user_id", "shown_at": "lt.1971-01-01T00:00:00Z"},
+            headers=read_headers,
+        )
+        if v_resp.status_code < 300:
+            for row in v_resp.json() or []:
+                add_pair(row.get("user_id"), row.get("target_user_id"))
+
         logger.info("[admin-wipe-relationships] preserving %d ex-pairs", len(ex_pairs))
 
         # === STEP 2 — do the wipe (existing logic) ======================
