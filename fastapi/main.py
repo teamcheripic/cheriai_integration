@@ -507,6 +507,7 @@ async def admin_wipe_relationships(
       • public.matches                    (HARD DELETE — evidence gone)
       • public.match_requests
       • public.user_match_views           (both recent + epoch sentinels)
+      • public.user_relationship_history  (permanent-ledger reset — QA only)
       • public.notifications where type ∈ matching-flow set
 
     KEEPS: user_profiles, user_memberships, cheri_ai_*, blocked_users,
@@ -562,11 +563,22 @@ async def admin_wipe_relationships(
     # nor unmatch ever deletes matches rows.
     WIPE_TARGETS: list[tuple[str, str]] = [
         # (table_name, filter_column) — filter col must be non-null on every row
-        ("match_reads",       "match_id"),        # composite PK (match_id, user_id)
-        ("match_messages",    "id"),
-        ("matches",           "id"),              # HARD-delete for true reset
-        ("match_requests",    "id"),
-        ("user_match_views",  "user_id"),         # composite PK (user_id, target_user_id) — includes epoch sentinels
+        ("match_reads",                "match_id"),  # composite PK (match_id, user_id)
+        ("match_messages",             "id"),
+        ("matches",                    "id"),        # HARD-delete for true reset
+        ("match_requests",             "id"),
+        ("user_match_views",           "user_id"),   # composite PK (user_id, target_user_id) — includes epoch sentinels
+        # user_relationship_history is the permanent ex-ledger (migration
+        # 033). RLS/REVOKE prevents client-side writes so re-pool and
+        # unmatch flows can never nuke it. The admin wipe button, however,
+        # explicitly clears it so QA can rebuild test scenarios from a
+        # true clean slate. Service-role key bypasses the REVOKE grants.
+        # Reported 2026-10-01: QA kept wiping and expecting Emma to see
+        # Sai again — but the history survived, so Sai stayed blocked.
+        # Keeping the two concerns separate: wipe = reset for admin;
+        # unmatch / sweep / re-pool = never touch history. Only this
+        # one endpoint on the service role can clear history.
+        ("user_relationship_history",  "user_a_id"), # composite PK (user_a_id, user_b_id)
     ]
 
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -1212,9 +1224,8 @@ async def chat(
             detail={
                 "error": "cheri_ai_monthly_limit_reached",
                 "message": (
-                    f"You've used all {int(limit)} of your Cheri messages for "
-                    f"this period. Upgrade your plan for more — they reset "
-                    f"{resets}."
+                    f"I'm sorry, but our time together has come to an end for now."
+                    f"I'd really like to continue this conversation with you. Upgrade your plan whenever you're ready, and we'll pick up right where we left off."
                 ),
                 "tier": tier,
                 "monthly_used": used,
