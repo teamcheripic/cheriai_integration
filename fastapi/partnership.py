@@ -61,6 +61,7 @@ from typing import Any
 import httpx
 
 from supabase_client import SUPABASE_KEY, SUPABASE_URL
+from transactional_email import send_transactional_email
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,29 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                 ],
             )
 
+            # Scenario 8 of the 2026-10-08 event-email spec: send both
+            # partners the celebration email with the other person's
+            # name. Load nick_names once; one send per partner.
+            nick_rows = await _pg_get(
+                client,
+                "public_profiles",
+                {
+                    "select": "user_id,nick_name",
+                    "user_id": f"in.({partner_ids[0]},{partner_ids[1]})",
+                },
+            )
+            nick_by_id = {r["user_id"]: (r.get("nick_name") or "your partner") for r in nick_rows}
+            for me, other in ((partner_ids[0], partner_ids[1]), (partner_ids[1], partner_ids[0])):
+                await send_transactional_email(
+                    user_id=me,
+                    template_slug="partner_proposal_accepted",
+                    extra_vars={
+                        "other_name": nick_by_id.get(other, "your partner"),
+                        "other_user_id": other,
+                    },
+                    dedup_window_hours=24,
+                )
+
         # ---- 3. Sweep side matches for both partners ----
         side_matches_deactivated = 0
         third_parties_notified: set[str] = set()
@@ -318,6 +342,67 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                     )
                     if inserted_ok:
                         third_parties_notified.add(third_party)
+                        # Scenarios 4+5 of the 2026-10-08 event-email spec:
+                        # someone the third party was mutually matched with
+                        # just partnered elsewhere. Email the connection_lost
+                        # template with a context line that reads naturally
+                        # from the third party's perspective. Dedup window
+                        # 24h — one email per losing-connection event, even
+                        # if the sweep re-runs during a self-heal retry.
+                        await send_transactional_email(
+                            user_id=third_party,
+                            template_slug="connection_lost",
+                            extra_vars={
+                                "context_line": (
+                                    "A connection you were building with has "
+                                    "chosen to make it official with someone else."
+                                ),
+                            },
+                            dedup_window_hours=24,
+                        )
+
+        # ---- 3.5. Collect third parties with PENDING interests touching
+        # either partner, BEFORE step 4 deletes those rows. These users
+        # also need the connection_lost email: they expressed interest
+        # (or were sent interest) that will never go anywhere now that
+        # the pair has partnered. Scenarios 4+5 of the 2026-10-08
+        # event-email spec — covers the "signal was pending, not a
+        # mutual match yet" case that step 3 doesn't see.
+        partner_ids_csv = ",".join(partner_ids)
+        pending_touching_partners = await _pg_get(
+            client,
+            "match_requests",
+            {
+                "select": "sender_id,receiver_id",
+                "or": (
+                    f"(sender_id.in.({partner_ids_csv}),"
+                    f"receiver_id.in.({partner_ids_csv}))"
+                ),
+            },
+        )
+        pending_third_parties: set[str] = set()
+        for r in pending_touching_partners:
+            s_id, r_id = r.get("sender_id"), r.get("receiver_id")
+            # The "third party" is whichever side ISN'T a partner.
+            if s_id and s_id not in partner_ids:
+                pending_third_parties.add(s_id)
+            if r_id and r_id not in partner_ids:
+                pending_third_parties.add(r_id)
+        # Skip anyone we already emailed in step 3 (mutual match path);
+        # that email already covered them.
+        pending_third_parties -= third_parties_notified
+        for tp in pending_third_parties:
+            await send_transactional_email(
+                user_id=tp,
+                template_slug="connection_lost",
+                extra_vars={
+                    "context_line": (
+                        "A connection you were exploring has chosen to make "
+                        "it official with someone else."
+                    ),
+                },
+                dedup_window_hours=24,
+            )
 
         # ---- 4. DELETE every match_requests row involving either partner ----
         # ALL statuses — pending, accepted, declined, expired. The
@@ -329,7 +414,6 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
         # sent-requests screen — the user reported this on
         # 2026-09-24 as "should be removed everywhere including
         # intrests, connect or requests".
-        partner_ids_csv = ",".join(partner_ids)
         await _pg_delete(
             client,
             "match_requests",

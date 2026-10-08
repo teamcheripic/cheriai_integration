@@ -916,6 +916,29 @@ async def matching_notify_partner_proposal(
                 "[partner-proposal] inserted: other=%s caller=%s match=%s",
                 other_id, caller_user_id, req.match_id,
             )
+
+            # Scenario 7 of the 2026-10-08 event-email spec: email the
+            # OTHER participant so they get the proposal in their inbox,
+            # not just the in-app bell. Pull caller's nick for the
+            # {{other_name}} slot in the template.
+            caller_prof = await client.get(
+                f"{SUPABASE_URL}/rest/v1/public_profiles",
+                params={"select": "user_id,nick_name", "user_id": f"eq.{caller_user_id}"},
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            )
+            caller_label = "Someone"
+            if caller_prof.status_code < 300 and caller_prof.json():
+                caller_label = caller_prof.json()[0].get("nick_name") or "Someone"
+        # Fire-and-forget — never block the proposal flow on an email.
+        await send_transactional_email(
+            user_id=other_id,
+            template_slug="partner_proposal_received",
+            extra_vars={
+                "other_name": caller_label,
+                "other_user_id": caller_user_id,
+            },
+            dedup_window_hours=2,
+        )
     except Exception as e:
         logger.error("[partner-proposal] notify failed: %r", e, exc_info=True)
         return {"ok": False, "exception": str(e)}
@@ -1012,6 +1035,245 @@ async def matching_notify_unmatch(
     except Exception as e:
         logger.error("[unmatch-notify] failed: %r", e, exc_info=True)
         return {"ok": False, "exception": str(e)}
+    return {"ok": True}
+
+
+class NotifyInterestRespondedRequest(BaseModel):
+    """Body for /matching/notify-interest-responded.
+
+    Caller is the user who accepted or declined (receiver of the
+    original interest). Server emails the SENDER so they know the
+    outcome. Server also writes the in-app notification using an
+    existing whitelist type (`interest_accepted` or `match_declined`).
+    """
+    sender_user_id: str
+    action: str  # 'accept' | 'decline'
+
+
+@app.post("/matching/notify-interest-responded", tags=["Matching"])
+async def matching_notify_interest_responded(
+    req: NotifyInterestRespondedRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    Fire-and-forget from respondToMatchRequest() after the DB update
+    lands. Emails the original SENDER with either the celebratory
+    accept template or the softer decline template. Also inserts an
+    in-app notification so the sender sees a bell dot immediately.
+
+    Covers scenarios 2 (interest accepted) and 3 (interest declined)
+    from the 2026-10-08 event-email spec. Dedup window on email is 2h
+    so a receiver who clicks accept-then-decline (unlikely but possible)
+    doesn't yield two emails.
+    """
+    action = (req.action or "").lower().strip()
+    if action not in ("accept", "decline"):
+        return {"ok": False, "error": "invalid_action"}
+    logger.info(
+        "[interest-responded] caller=%s sender=%s action=%s",
+        caller_user_id, req.sender_user_id, action,
+    )
+    accepted = action == "accept"
+    notif_type = "interest_accepted" if accepted else "match_declined"
+    template_slug = "interest_accepted" if accepted else "interest_declined"
+    title = (
+        "Your interest was accepted ✨"
+        if accepted
+        else "An update on your sent interest"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Load caller's nick_name for template vars
+            prof = await client.get(
+                f"{SUPABASE_URL}/rest/v1/public_profiles",
+                params={"select": "user_id,nick_name", "user_id": f"eq.{caller_user_id}"},
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            )
+            other_label = "Someone"
+            if prof.status_code < 300 and prof.json():
+                other_label = prof.json()[0].get("nick_name") or "Someone"
+
+            # In-app notification for the sender (service key bypasses RLS)
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/notifications",
+                json={
+                    "user_id": req.sender_user_id,
+                    "type": notif_type,
+                    "title": title,
+                    "body": (
+                        f"{other_label} accepted your interest." if accepted
+                        else "Your recent interest didn't connect. Keep going."
+                    ),
+                    "related_user_id": caller_user_id,
+                },
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+            )
+        # Email the sender. extra_vars = {other_name}
+        await send_transactional_email(
+            user_id=req.sender_user_id,
+            template_slug=template_slug,
+            extra_vars={"other_name": other_label},
+            dedup_window_hours=2,
+        )
+    except Exception as e:
+        logger.error("[interest-responded] failed: %r", e, exc_info=True)
+    return {"ok": True}
+
+
+class NotifyProposalDeclinedRequest(BaseModel):
+    """Body for /matching/notify-partner-proposal-declined.
+
+    Caller is the user who DECLINED (or unmatched before accepting)
+    a Make-it-Official proposal from `proposer_user_id`.
+    """
+    proposer_user_id: str
+
+
+@app.post("/matching/notify-partner-proposal-declined", tags=["Matching"])
+async def matching_notify_partner_proposal_declined(
+    req: NotifyProposalDeclinedRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    Fire-and-forget when a user unmatches a connection where the OTHER
+    side had tapped "Make it Official" first and was waiting for them.
+    Emails the proposer with the softer "declined" template so they
+    don't just get a generic unmatch notice.
+
+    Covers scenario 9 from the 2026-10-08 event-email spec. Front end
+    detects the case (match where other side has partner_accepted set
+    but caller hasn't) during the unmatch flow and routes to this
+    endpoint instead of the generic notify-unmatch.
+    """
+    logger.info(
+        "[proposal-declined] caller=%s proposer=%s",
+        caller_user_id, req.proposer_user_id,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            prof = await client.get(
+                f"{SUPABASE_URL}/rest/v1/public_profiles",
+                params={"select": "user_id,nick_name", "user_id": f"eq.{caller_user_id}"},
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            )
+            caller_label = "Someone"
+            if prof.status_code < 300 and prof.json():
+                caller_label = prof.json()[0].get("nick_name") or "Someone"
+
+        await send_transactional_email(
+            user_id=req.proposer_user_id,
+            template_slug="partner_proposal_declined",
+            extra_vars={"other_name": caller_label},
+            dedup_window_hours=2,
+        )
+    except Exception as e:
+        logger.error("[proposal-declined] failed: %r", e, exc_info=True)
+    return {"ok": True}
+
+
+class NotifyUnreadMessageRequest(BaseModel):
+    """Body for /chat/notify-unread-message.
+
+    Caller is the SENDER. Server emails `receiver_user_id` with a
+    1-per-hour-per-pair dedup so a chatty burst produces at most one
+    nudge per hour, not an avalanche.
+    """
+    receiver_user_id: str
+
+
+@app.post("/chat/notify-unread-message", tags=["Chat"])
+async def chat_notify_unread_message(
+    req: NotifyUnreadMessageRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    Fire-and-forget from sendMatchMessage() after insert. Debounced
+    to one email per (sender→receiver) pair per hour via
+    send_transactional_email's built-in dedup; the recipient still
+    receives all messages in the app, we're just preventing an
+    email per message.
+
+    Covers scenario 6 from the 2026-10-08 event-email spec. Front end
+    should ONLY call this when the receiver hasn't opened the chat
+    recently (otherwise an email about a message they're actively
+    reading is pure noise). The server-side dedup is a safety net.
+    """
+    logger.info(
+        "[chat-notify-unread] sender=%s receiver=%s",
+        caller_user_id, req.receiver_user_id,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            prof = await client.get(
+                f"{SUPABASE_URL}/rest/v1/public_profiles",
+                params={"select": "user_id,nick_name", "user_id": f"eq.{caller_user_id}"},
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            )
+            sender_label = "Someone"
+            if prof.status_code < 300 and prof.json():
+                sender_label = prof.json()[0].get("nick_name") or "Someone"
+
+        await send_transactional_email(
+            user_id=req.receiver_user_id,
+            template_slug="red_room_message_unread",
+            extra_vars={
+                "sender_name": sender_label,
+                "sender_user_id": caller_user_id,
+            },
+            dedup_window_hours=1,
+        )
+    except Exception as e:
+        logger.error("[chat-notify-unread] failed: %r", e, exc_info=True)
+    return {"ok": True}
+
+
+class NotifyAssessmentCompletedRequest(BaseModel):
+    """Body for /assessment/notify-completed. Caller is the assessment
+    taker; server emails them with their score + readiness verdict."""
+    score: int
+    eligible: bool
+
+
+@app.post("/assessment/notify-completed", tags=["Assessment"])
+async def assessment_notify_completed(
+    req: NotifyAssessmentCompletedRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    Fire-and-forget from the CheriAI assessment completion UI. Sends
+    the user their score + a tailored result line (eligible → next
+    steps; not eligible → encouragement to retake).
+
+    Covers scenario 10 from the 2026-10-08 event-email spec. Dedup
+    window 24h so a user who retakes multiple times in a day doesn't
+    get flooded, but a legitimate re-attempt the next day does.
+    """
+    logger.info(
+        "[assessment-completed] caller=%s score=%s eligible=%s",
+        caller_user_id, req.score, req.eligible,
+    )
+    result_line = (
+        "You're ready to meet connections aligned with your values — Discover is open."
+        if req.eligible
+        else "You scored below the readiness threshold. Spend some time with the reflections and retake when you're ready — your matches will be richer for it."
+    )
+    try:
+        await send_transactional_email(
+            user_id=caller_user_id,
+            template_slug="assessment_completed",
+            extra_vars={
+                "score": req.score,
+                "result_line": result_line,
+            },
+            dedup_window_hours=24,
+        )
+    except Exception as e:
+        logger.error("[assessment-completed] failed: %r", e, exc_info=True)
     return {"ok": True}
 
 
