@@ -728,9 +728,19 @@ async def admin_trigger_push(
     # Broadcast branch — one HTTP call to OneSignal with the segment
     # name instead of per-user external_id loop.
     if req.user_id.lower().strip() == "all":
+        # Segment name differs per OneSignal account vintage:
+        #   • Legacy apps (pre-2024)   → "Subscribed Users"
+        #   • Modern V11+ apps (ours)  → "Active Subscriptions"
+        # Reported 2026-10-11: broadcast returned "All included players are
+        # not subscribed" because our app's default segments are named the
+        # newer way and "Subscribed Users" didn't exist here. We send to
+        # BOTH names — OneSignal's segment matcher is OR-based (fire if
+        # the user is in ANY listed segment) so this harmlessly covers
+        # both account vintages. Missing segment names are silently
+        # ignored by OneSignal, so no error if one isn't defined.
         payload: dict[str, Any] = {
             "app_id": _APP_ID,
-            "included_segments": ["Subscribed Users"],
+            "included_segments": ["Active Subscriptions", "Subscribed Users"],
             "headings": {"en": req.title},
             "contents": {"en": req.body},
             "data": {"campaign": req.campaign},
@@ -752,12 +762,27 @@ async def admin_trigger_push(
                 body = resp.json()
             except Exception:
                 body = {"raw": resp.text[:400]}
-        if resp.status_code >= 300:
+        # OneSignal's broadcast endpoint returns HTTP 200 even when zero
+        # recipients were found — the "success" is just "we accepted
+        # your request", not "we delivered". Check the body shape: a
+        # real delivery returns a non-empty `id` and no `errors`.
+        # Reported 2026-10-11: admin got ok=true + errors=["All
+        # included players are not subscribed"] which is NOT a success
+        # outcome.
+        has_errors = bool(body.get("errors")) if isinstance(body, dict) else False
+        has_id = bool(body.get("id")) if isinstance(body, dict) else False
+        delivered = (resp.status_code < 300) and has_id and not has_errors
+        if not delivered:
             logger.warning(
-                "[admin-trigger-push] broadcast failed [%s]: %s",
-                resp.status_code, resp.text[:200],
+                "[admin-trigger-push] broadcast NO delivery [%s]: %s",
+                resp.status_code, resp.text[:400],
             )
-            return {"ok": False, "mode": "broadcast", "status": resp.status_code, "detail": body}
+            return {
+                "ok": False,
+                "mode": "broadcast",
+                "status": resp.status_code,
+                "onesignal": body,
+            }
         return {"ok": True, "mode": "broadcast", "onesignal": body}
 
     # Targeted branch — delegate to the shared helper so audit +
