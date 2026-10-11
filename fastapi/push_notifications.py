@@ -162,6 +162,31 @@ async def send_push_notification(
     if not user_id:
         return False
 
+    # OneSignal rejects web_url that isn't a full http(s) URL ("Option
+    # Begin your notification web_url with http:// or https://."). Our
+    # per-scenario call sites + the admin test UI pass relative paths
+    # like "/#/home" or "/#/matching?tab=received" since the frontend
+    # uses HashRouter. Normalize here so every caller is covered: if
+    # url is relative, prepend APP_BASE_URL from app_config (default
+    # https://cheripic.com). Reported 2026-10-11.
+    if url and not (url.startswith("http://") or url.startswith("https://")):
+        try:
+            from cron_daily_email import _cfg_app_base_url
+            base = (await _cfg_app_base_url()).rstrip("/")
+            # Hash routes like "/#/home" need "/" preserved between
+            # host and hash — "https://cheripic.com" + "/#/home" is
+            # exactly what we want. Absolute path "/foo" works the
+            # same. If url starts with "#" (bare hash), join with "/".
+            if url.startswith("#"):
+                url = base + "/" + url
+            elif url.startswith("/"):
+                url = base + url
+            else:
+                url = base + "/" + url
+        except Exception as e:
+            logger.warning("[push] url normalize failed: %r — stripping url entirely so send proceeds", e)
+            url = None
+
     async with httpx.AsyncClient() as client:
         if await _already_pushed_recently(client, user_id, campaign, dedup_window_hours):
             logger.info(

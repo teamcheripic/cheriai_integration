@@ -745,9 +745,26 @@ async def admin_trigger_push(
             "contents": {"en": req.body},
             "data": {"campaign": req.campaign},
         }
-        if req.url:
-            payload["web_url"] = req.url
-            payload["data"]["url"] = req.url
+        # Normalize relative paths to absolute http(s) URLs — OneSignal
+        # rejects "/#/home" with "Option Begin your notification web_url
+        # with http:// or https://." Mirror the same logic used in
+        # push_notifications.send_push_notification for consistency.
+        normalized_url = req.url
+        if normalized_url and not (normalized_url.startswith("http://") or normalized_url.startswith("https://")):
+            try:
+                from cron_daily_email import _cfg_app_base_url
+                base = (await _cfg_app_base_url()).rstrip("/")
+                if normalized_url.startswith("#"):
+                    normalized_url = base + "/" + normalized_url
+                elif normalized_url.startswith("/"):
+                    normalized_url = base + normalized_url
+                else:
+                    normalized_url = base + "/" + normalized_url
+            except Exception:
+                normalized_url = None
+        if normalized_url:
+            payload["web_url"] = normalized_url
+            payload["data"]["url"] = normalized_url
         async with _httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(
                 _API,
