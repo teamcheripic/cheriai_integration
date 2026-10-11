@@ -794,6 +794,35 @@ async def matching_notify_interest_received(
             template_slug="interest_received",
             dedup_window_hours=2,
         )
+
+        # OneSignal push alongside the email — reaches users who have
+        # the PWA installed and granted notification permission. 2026-10-11
+        # addition. Fire-and-forget; silently no-ops if OneSignal env
+        # isn't configured or the user has no push subscription.
+        # Shorter dedup (1h) than email because push feels less
+        # intrusive than inbox spam.
+        try:
+            # Look up sender's nick for a personal title. public_profiles
+            # is public-safe (no email leak).
+            sender_prof = await client.get(
+                f"{SUPABASE_URL}/rest/v1/public_profiles",
+                params={"select": "nick_name", "user_id": f"eq.{caller_user_id}"},
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            )
+            sender_label = "Someone"
+            if sender_prof.status_code < 300 and sender_prof.json():
+                sender_label = sender_prof.json()[0].get("nick_name") or "Someone"
+        except Exception:
+            sender_label = "Someone"
+        from push_notifications import send_push_notification
+        await send_push_notification(
+            user_id=req.receiver_user_id,
+            title=f"{sender_label} is interested in you",
+            body="Open your requests to decide.",
+            campaign="interest_received",
+            url="/#/matching?tab=received",
+            dedup_window_hours=1,
+        )
     except Exception as e:
         # Log but never surface — the fire-and-forget contract is
         # "the interest send succeeded, this side-channel is bonus".
