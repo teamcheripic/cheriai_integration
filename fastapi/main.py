@@ -665,6 +665,115 @@ async def admin_trigger_email(
     return {"ok": ok, "template": req.template_slug, "user_id": req.user_id}
 
 
+class AdminTriggerPushRequest(BaseModel):
+    """Body for /admin/trigger-push.
+
+    Fire a OneSignal push to a specific user, OR broadcast to every
+    subscribed user. 'user_id' takes a Supabase uuid OR the literal
+    string 'all' to broadcast via OneSignal's "Subscribed Users"
+    segment. Dedup is disabled by default so admin test fires always
+    land on target. Title/body are the push copy. Optional url is the
+    deep-link click target.
+    """
+    user_id: str  # Supabase uuid OR 'all' for broadcast
+    title: str
+    body: str
+    url: str | None = None
+    campaign: str = "admin_test"
+    dedup_window_hours: int = 0  # admin tests should ALWAYS send
+
+
+@app.post("/admin/trigger-push", tags=["Admin"])
+async def admin_trigger_push(
+    req: AdminTriggerPushRequest,
+    admin_user_id: str = Depends(get_current_admin_id),
+):
+    """
+    Admin-only: fire a OneSignal push to one user by uuid OR
+    broadcast to all subscribed users with include_segments:
+    ['Subscribed Users'].
+
+    Use cases:
+      • QA — verify the OneSignal pipeline end-to-end for a specific
+        user before shipping new scenarios.
+      • Operational notice — one-shot broadcast ("maintenance window
+        starts in 10 min") to every installed PWA / browser session.
+      • Reactivation nudge — targeted push to a user who last opened
+        the app 30 days ago.
+
+    Returns the OneSignal API response for debugging. In broadcast
+    mode we skip the sent_push audit (one row per recipient would
+    explode the table) and only log at the service level — the admin
+    is implicitly tracking from OneSignal dashboard anyway.
+    """
+    import httpx as _httpx
+    from push_notifications import (
+        ONESIGNAL_APP_ID as _APP_ID,
+        ONESIGNAL_REST_API_KEY as _KEY,
+        ONESIGNAL_API_URL as _API,
+        send_push_notification as _send_targeted,
+    )
+
+    if not _APP_ID or not _KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="ONESIGNAL env not configured on server. Set ONESIGNAL_APP_ID + ONESIGNAL_REST_API_KEY in Railway.",
+        )
+
+    logger.info(
+        "[admin-trigger-push] admin=%s target=%s title=%r",
+        admin_user_id, req.user_id, req.title[:60],
+    )
+
+    # Broadcast branch — one HTTP call to OneSignal with the segment
+    # name instead of per-user external_id loop.
+    if req.user_id.lower().strip() == "all":
+        payload: dict[str, Any] = {
+            "app_id": _APP_ID,
+            "included_segments": ["Subscribed Users"],
+            "headings": {"en": req.title},
+            "contents": {"en": req.body},
+            "data": {"campaign": req.campaign},
+        }
+        if req.url:
+            payload["web_url"] = req.url
+            payload["data"]["url"] = req.url
+        async with _httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                _API,
+                json=payload,
+                headers={
+                    "Authorization": f"Key {_KEY}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            try:
+                body = resp.json()
+            except Exception:
+                body = {"raw": resp.text[:400]}
+        if resp.status_code >= 300:
+            logger.warning(
+                "[admin-trigger-push] broadcast failed [%s]: %s",
+                resp.status_code, resp.text[:200],
+            )
+            return {"ok": False, "mode": "broadcast", "status": resp.status_code, "detail": body}
+        return {"ok": True, "mode": "broadcast", "onesignal": body}
+
+    # Targeted branch — delegate to the shared helper so audit +
+    # dedup-window plumbing stays in one place. dedup_window_hours=0
+    # by default (admin tests should always send).
+    ok = await _send_targeted(
+        user_id=req.user_id,
+        title=req.title,
+        body=req.body,
+        campaign=req.campaign,
+        url=req.url,
+        dedup_window_hours=req.dedup_window_hours,
+    )
+    return {"ok": ok, "mode": "targeted", "user_id": req.user_id}
+
+
 class NotifyInterestReceivedRequest(BaseModel):
     """Body for /matching/notify-interest-received.
 
