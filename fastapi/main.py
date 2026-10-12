@@ -1202,6 +1202,30 @@ async def matching_notify_unmatch(
                 )
                 return {"ok": False, "insert_status": ins.status_code, "detail": ins.text[:400]}
             logger.info("[unmatch-notify] inserted %d rows", len(notifs))
+
+        # 2026-10-12 fix: a PARTNERED unmatch (the user ended a formal
+        # relationship) needs email + push to the OTHER partner, not
+        # just an in-app notification. For a non-partnered unmatch
+        # we stay in-app only — generic connection ends are quiet by
+        # design. Only email/push the OTHER user, not the initiator
+        # (they chose the action, no reason to notify them of their
+        # own choice via another channel). Fire-and-forget — the
+        # unmatch itself already succeeded; a template miss or dedup
+        # must not fail the endpoint. Push auto-fires via
+        # NOTIFICATION_REGISTRY after email.
+        if req.was_partnered:
+            try:
+                await send_transactional_email(
+                    user_id=req.other_user_id,
+                    template_slug="relationship_ended",
+                    extra_vars={"other_name": caller_label},
+                    dedup_window_hours=24,
+                    related_user_id=caller_user_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[unmatch-notify] relationship_ended email+push failed: %r", e
+                )
     except Exception as e:
         logger.error("[unmatch-notify] failed: %r", e, exc_info=True)
         return {"ok": False, "exception": str(e)}

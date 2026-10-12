@@ -338,6 +338,12 @@ NOTIFICATION_REGISTRY: dict[str, dict[str, Any]] = {
         "url":   "/#/matching",
         "dedup_window_hours": 1,
     },
+    "relationship_ended": {
+        "title": "An update on your partnership",
+        "body":  "{{other_name}} has ended your CheriPic partnership. Tap for details.",
+        "url":   "/#/matching",
+        "dedup_window_hours": 24,
+    },
     # --- Red Room messaging --------------------------------------------
     # Explicit push wire remains in /chat/notify-unread-message (that
     # endpoint intentionally does NOT call send_transactional_email per
