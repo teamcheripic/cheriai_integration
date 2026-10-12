@@ -939,17 +939,25 @@ async def matching_notify_interest_received(
 
         # Fetch sender's nick_name so BOTH email and push can personalize
         # (the registry's push title is "{{other_name}} is interested in you").
+        # Note: outer `async with httpx.AsyncClient() as client:` was CLOSED
+        # above (sender_label was previously fetched there and the whole
+        # notification-insert section lived inside the context). Doing
+        # `await client.get(...)` after the close raised RuntimeError and
+        # was swallowed by the except below — the email + push still fired
+        # but with sender_label="Someone" every time. Fix: open a fresh
+        # AsyncClient here.
+        sender_label = "Someone"
         try:
-            sender_prof = await client.get(
-                f"{SUPABASE_URL}/rest/v1/public_profiles",
-                params={"select": "nick_name", "user_id": f"eq.{caller_user_id}"},
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
-            )
-            sender_label = "Someone"
-            if sender_prof.status_code < 300 and sender_prof.json():
-                sender_label = sender_prof.json()[0].get("nick_name") or "Someone"
-        except Exception:
-            sender_label = "Someone"
+            async with httpx.AsyncClient(timeout=10.0) as client2:
+                sender_prof = await client2.get(
+                    f"{SUPABASE_URL}/rest/v1/public_profiles",
+                    params={"select": "nick_name", "user_id": f"eq.{caller_user_id}"},
+                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+                )
+                if sender_prof.status_code < 300 and sender_prof.json():
+                    sender_label = sender_prof.json()[0].get("nick_name") or "Someone"
+        except Exception as e:
+            logger.warning("[interest-received] sender_label fetch failed: %r", e)
 
         # Send the email. dedup=2h so 5 senders in 90 min → 1 email.
         # Push auto-fires right after via NOTIFICATION_REGISTRY (slug

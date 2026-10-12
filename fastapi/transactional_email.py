@@ -255,17 +255,36 @@ async def send_transactional_email(
             subject = _apply_template_vars(template["subject"], ctx)
             html = _apply_template_vars(template["html_body"], ctx)
             text = _apply_template_vars(template.get("text_body") or "", ctx)
-            email_ok, provider_id = await send_email(client, recipient, subject, html, text)
-            await _record_send(
-                client,
-                user_id=user_id,
-                email=recipient,
-                campaign=template_slug,
-                subject=subject,
-                provider_id=provider_id,
-                status="sent" if email_ok else "failed",
-                related_user_id=related_user_id,
-            )
+            # Resend network-timeout or any transient error must NOT
+            # abort the companion push below. Reported 2026-10-12: an
+            # unhandled httpx.TimeoutException from send_email was
+            # propagating out of send_transactional_email, caught by
+            # the caller's outer try/except, and silencing push too.
+            provider_id: str | None = None
+            try:
+                email_ok, provider_id = await send_email(client, recipient, subject, html, text)
+            except Exception as e:
+                email_ok = False
+                logger.warning(
+                    "[transactional_email] send_email threw for %s to %s: %r",
+                    template_slug, user_id, e,
+                )
+            try:
+                await _record_send(
+                    client,
+                    user_id=user_id,
+                    email=recipient,
+                    campaign=template_slug,
+                    subject=subject,
+                    provider_id=provider_id,
+                    status="sent" if email_ok else "failed",
+                    related_user_id=related_user_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[transactional_email] _record_send threw for %s to %s: %r",
+                    template_slug, user_id, e,
+                )
             if email_ok:
                 logger.info(
                     "[transactional_email] sent %s to %s (%s) resend_id=%s",
