@@ -62,7 +62,7 @@ async def _already_pushed_recently(
     client: httpx.AsyncClient,
     user_id: str,
     campaign: str,
-    hours: int,
+    hours: float,
     related_user_id: str | None = None,
 ) -> bool:
     """
@@ -152,7 +152,7 @@ async def send_push_notification(
     campaign: str,
     data: dict[str, Any] | None = None,
     url: str | None = None,
-    dedup_window_hours: int = 1,
+    dedup_window_hours: float = 1,
     related_user_id: str | None = None,
 ) -> bool:
     """

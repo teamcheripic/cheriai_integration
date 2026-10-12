@@ -1398,9 +1398,20 @@ async def chat_notify_unread_message(
         # 2026-10-12 spec: Red Room unread messages → PUSH ONLY, no email.
         # Chat is a push-friendly interaction (lock-screen prompt, open and
         # reply); an email on top adds inbox noise for a signal the user
-        # will see when they next open the app anyway. Previously we also
-        # fired send_transactional_email("red_room_message_unread") — that
-        # call is REMOVED per the new channel spec.
+        # will see when they next open the app anyway.
+        #
+        # WhatsApp-style gating (2026-10-12 refinement):
+        #   • Primary gate is CLIENT-SIDE: the sender's RedRoomChat
+        #     checks chat-presence-<matchId> and skips this call entirely
+        #     when the receiver is actively viewing. See
+        #     isReceiverPresentInChat in matchingService.ts.
+        #   • This endpoint's own dedup is now a short burst-coalescer
+        #     (10 seconds) rather than a 1-hour hold. A back-to-back
+        #     3-message typing burst produces 1 push; a reply 15 seconds
+        #     later goes through. Pre-fix we used 1h which held any
+        #     subsequent message silent for the full hour — wrong for
+        #     real-time chat. send_push_notification only accepts the
+        #     window in hours, so 10 seconds is passed as 10/3600 h.
         from push_notifications import send_push_notification
         await send_push_notification(
             user_id=req.receiver_user_id,
@@ -1408,7 +1419,7 @@ async def chat_notify_unread_message(
             body="Tap to open your Red Room.",
             campaign="red_room_message_unread",
             url=f"/#/chat/{caller_user_id}",
-            dedup_window_hours=1,
+            dedup_window_hours=10 / 3600,
             related_user_id=caller_user_id,
         )
     except Exception as e:
