@@ -937,24 +937,9 @@ async def matching_notify_interest_received(
                         notif_resp.status_code, notif_resp.text[:200],
                     )
 
-        # Send the email. dedup=2h so 5 senders in 90 min → 1 email.
-        # send_transactional_email never raises; it returns False on
-        # any skip/failure and logs internally.
-        await send_transactional_email(
-            user_id=req.receiver_user_id,
-            template_slug="interest_received",
-            dedup_window_hours=2,
-        )
-
-        # OneSignal push alongside the email — reaches users who have
-        # the PWA installed and granted notification permission. 2026-10-11
-        # addition. Fire-and-forget; silently no-ops if OneSignal env
-        # isn't configured or the user has no push subscription.
-        # Shorter dedup (1h) than email because push feels less
-        # intrusive than inbox spam.
+        # Fetch sender's nick_name so BOTH email and push can personalize
+        # (the registry's push title is "{{other_name}} is interested in you").
         try:
-            # Look up sender's nick for a personal title. public_profiles
-            # is public-safe (no email leak).
             sender_prof = await client.get(
                 f"{SUPABASE_URL}/rest/v1/public_profiles",
                 params={"select": "nick_name", "user_id": f"eq.{caller_user_id}"},
@@ -965,14 +950,15 @@ async def matching_notify_interest_received(
                 sender_label = sender_prof.json()[0].get("nick_name") or "Someone"
         except Exception:
             sender_label = "Someone"
-        from push_notifications import send_push_notification
-        await send_push_notification(
+
+        # Send the email. dedup=2h so 5 senders in 90 min → 1 email.
+        # Push auto-fires right after via NOTIFICATION_REGISTRY (slug
+        # has push_config). Single source of truth for channel routing.
+        await send_transactional_email(
             user_id=req.receiver_user_id,
-            title=f"{sender_label} is interested in you",
-            body="Open your requests to decide.",
-            campaign="interest_received",
-            url="/#/matching?tab=received",
-            dedup_window_hours=1,
+            template_slug="interest_received",
+            extra_vars={"other_name": sender_label},
+            dedup_window_hours=2,
         )
     except Exception as e:
         # Log but never surface — the fire-and-forget contract is
@@ -1110,6 +1096,8 @@ async def matching_notify_partner_proposal(
             if caller_prof.status_code < 300 and caller_prof.json():
                 caller_label = caller_prof.json()[0].get("nick_name") or "Someone"
         # Fire-and-forget — never block the proposal flow on an email.
+        # Push auto-fires via NOTIFICATION_REGISTRY (partner_proposal_received
+        # has push_config with /#/chat/{{other_user_id}} deep link).
         await send_transactional_email(
             user_id=other_id,
             template_slug="partner_proposal_received",
@@ -1293,7 +1281,10 @@ async def matching_notify_interest_responded(
                     "Prefer": "return=minimal",
                 },
             )
-        # Email the sender. extra_vars = {other_name}
+        # Email the sender. Push auto-fires via NOTIFICATION_REGISTRY
+        # (interest_accepted / interest_declined both have push_config).
+        # extra_vars.{other_name} personalizes both the email body and
+        # the registry's push title ({{other_name}} accepted your interest).
         await send_transactional_email(
             user_id=req.sender_user_id,
             template_slug=template_slug,
@@ -1345,6 +1336,8 @@ async def matching_notify_partner_proposal_declined(
             if prof.status_code < 300 and prof.json():
                 caller_label = prof.json()[0].get("nick_name") or "Someone"
 
+        # Push auto-fires via NOTIFICATION_REGISTRY (partner_proposal_declined
+        # has push_config). Single source of truth for channel routing.
         await send_transactional_email(
             user_id=req.proposer_user_id,
             template_slug="partner_proposal_declined",
@@ -1398,13 +1391,19 @@ async def chat_notify_unread_message(
             if prof.status_code < 300 and prof.json():
                 sender_label = prof.json()[0].get("nick_name") or "Someone"
 
-        await send_transactional_email(
+        # 2026-10-12 spec: Red Room unread messages → PUSH ONLY, no email.
+        # Chat is a push-friendly interaction (lock-screen prompt, open and
+        # reply); an email on top adds inbox noise for a signal the user
+        # will see when they next open the app anyway. Previously we also
+        # fired send_transactional_email("red_room_message_unread") — that
+        # call is REMOVED per the new channel spec.
+        from push_notifications import send_push_notification
+        await send_push_notification(
             user_id=req.receiver_user_id,
-            template_slug="red_room_message_unread",
-            extra_vars={
-                "sender_name": sender_label,
-                "sender_user_id": caller_user_id,
-            },
+            title=f"{sender_label} sent you a message 💬",
+            body="Tap to open your Red Room.",
+            campaign="red_room_message_unread",
+            url=f"/#/chat/{caller_user_id}",
             dedup_window_hours=1,
         )
     except Exception as e:
@@ -1443,6 +1442,12 @@ async def assessment_notify_completed(
         else "You scored below the readiness threshold. Spend some time with the reflections and retake when you're ready — your matches will be richer for it."
     )
     try:
+        # 2026-10-12 spec: assessment completion → EMAIL ONLY, no push.
+        # The user is already on-device completing the assessment, so a
+        # push a second later would be redundant. The email serves as a
+        # permanent record they can refer back to. assessment_completed
+        # is intentionally OMITTED from NOTIFICATION_REGISTRY so this
+        # send stays email-only.
         await send_transactional_email(
             user_id=caller_user_id,
             template_slug="assessment_completed",

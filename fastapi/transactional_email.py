@@ -223,4 +223,131 @@ async def send_transactional_email(
                 "[transactional_email] send failed for %s to %s",
                 template_slug, user_id,
             )
+
+        # ---- Companion push notification ------------------------------------
+        # 2026-10-12 refactor: channel decisions live in NOTIFICATION_REGISTRY
+        # below. If the slug has a push_config, we fire push after email so
+        # every call site that already emails ALSO pushes — zero per-site
+        # code changes. Slugs NOT in the registry stay email-only (welcome_*,
+        # payment_*, membership_upgraded, assessment_completed, etc).
+        try:
+            push_cfg = NOTIFICATION_REGISTRY.get(template_slug)
+            if push_cfg is not None:
+                # Lazy import so transactional_email.py doesn't require the
+                # push module when ONESIGNAL env isn't set — push_notifications
+                # itself early-returns False in that case.
+                from push_notifications import send_push_notification
+                title = _apply_template_vars(push_cfg["title"], ctx)
+                body = _apply_template_vars(push_cfg["body"], ctx)
+                url_tpl = push_cfg.get("url")
+                url = _apply_template_vars(url_tpl, ctx) if url_tpl else None
+                await send_push_notification(
+                    user_id=user_id,
+                    title=title,
+                    body=body,
+                    campaign=template_slug,
+                    url=url,
+                    dedup_window_hours=push_cfg.get("dedup_window_hours", 1),
+                )
+        except Exception as e:
+            logger.warning(
+                "[transactional_email] companion push failed for %s to %s: %r",
+                template_slug, user_id, e,
+            )
+
         return ok
+
+
+# =============================================================================
+# NOTIFICATION_REGISTRY — single source of truth for which campaigns
+# push alongside their email, with the push copy templated against the
+# same {{var}} context the email uses. Add a slug here → every call to
+# send_transactional_email(slug) auto-fires push after email. Omit a
+# slug → email only. Reported 2026-10-12.
+# =============================================================================
+NOTIFICATION_REGISTRY: dict[str, dict[str, Any]] = {
+    # --- Matching flow (both channels) --------------------------------
+    "interest_received": {
+        "title": "{{other_name}} is interested in you",
+        "body":  "Open your requests to decide.",
+        "url":   "/#/matching?tab=received",
+        "dedup_window_hours": 1,
+    },
+    "interest_accepted": {
+        "title": "{{other_name}} accepted your interest ✨",
+        "body":  "Tap to open your Red Room.",
+        "url":   "/#/matching?tab=sent",
+        "dedup_window_hours": 1,
+    },
+    "interest_declined": {
+        "title": "An update on your interest",
+        "body":  "They weren't ready this time — keep going.",
+        "url":   "/#/matching",
+        "dedup_window_hours": 1,
+    },
+    "connection_lost": {
+        "title": "A connection has moved on",
+        "body":  "They partnered elsewhere. Discover is open.",
+        "url":   "/#/matching",
+        "dedup_window_hours": 24,
+    },
+    "partner_proposal_received": {
+        "title": "{{other_name}} wants to make it official 💞",
+        "body":  "Open your Red Room to review and accept.",
+        "url":   "/#/chat/{{other_user_id}}",
+        "dedup_window_hours": 1,
+    },
+    "partner_proposal_accepted": {
+        "title": "You and {{other_name}} are official 💞",
+        "body":  "New introductions paused. Tap to open your Red Room.",
+        "url":   "/#/chat/{{other_user_id}}",
+        "dedup_window_hours": 24,
+    },
+    "partner_proposal_declined": {
+        "title": "An update on your Make-it-Official request",
+        "body":  "{{other_name}} wasn't ready this time.",
+        "url":   "/#/matching",
+        "dedup_window_hours": 1,
+    },
+    # --- Red Room messaging --------------------------------------------
+    # Explicit push wire remains in /chat/notify-unread-message (that
+    # endpoint intentionally does NOT call send_transactional_email per
+    # 2026-10-12 spec: push only, no email).
+    # --- Verification (both channels) ----------------------------------
+    "verify_approved": {
+        "title": "You're verified on CheriPic ✓",
+        "body":  "Full access unlocked. Open the app to meet connections.",
+        "url":   "/#/profile",
+        "dedup_window_hours": 24,
+    },
+    "verify_needs_attention": {
+        "title": "Action required on your verification",
+        "body":  "Please re-submit your documents. Tap to review.",
+        "url":   "/#/profile",
+        "dedup_window_hours": 24,
+    },
+    "verify_revoked": {
+        "title": "Important update on your verification",
+        "body":  "Your verified status was revoked. Open profile for details.",
+        "url":   "/#/profile",
+        "dedup_window_hours": 24,
+    },
+    # --- Subscription lifecycle (both channels) ------------------------
+    "membership_cancelled": {
+        "title": "Your CheriPic subscription has been cancelled",
+        "body":  "You'll keep access until the current billing period ends.",
+        "url":   "/#/profile",
+        "dedup_window_hours": 24,
+    },
+    "premium_ended": {
+        "title": "Your CheriPic Premium access has ended",
+        "body":  "You're back on the Free tier. Tap to re-upgrade anytime.",
+        "url":   "/#/pricing",
+        "dedup_window_hours": 24,
+    },
+    # NOTE: scenarios below are intentionally OMITTED from the registry
+    # per user spec 2026-10-12 — email only, no push:
+    #   assessment_completed, welcome_free, welcome_premium_lite,
+    #   welcome_premium, membership_upgraded, payment_successful,
+    #   payment_failed, verification_submitted
+}

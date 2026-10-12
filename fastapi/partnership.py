@@ -253,6 +253,11 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                 },
             )
             nick_by_id = {r["user_id"]: (r.get("nick_name") or "your partner") for r in nick_rows}
+            # Push auto-fires via NOTIFICATION_REGISTRY after each
+            # email — partner_proposal_accepted has push_config with
+            # /#/chat/{{other_user_id}} deep link and 24h dedup.
+            # Single source of truth: channel routing lives in the
+            # registry (transactional_email.py).
             for me, other in ((partner_ids[0], partner_ids[1]), (partner_ids[1], partner_ids[0])):
                 await send_transactional_email(
                     user_id=me,
@@ -360,6 +365,7 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                             },
                             dedup_window_hours=24,
                         )
+                        # Push auto-fires via NOTIFICATION_REGISTRY (connection_lost).
 
         # ---- 3.5. Collect third parties with PENDING interests touching
         # either partner, BEFORE step 4 deletes those rows. These users
@@ -403,6 +409,7 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                 },
                 dedup_window_hours=24,
             )
+            # Push auto-fires via NOTIFICATION_REGISTRY (connection_lost).
 
         # ---- 4. DELETE every match_requests row involving either partner ----
         # ALL statuses — pending, accepted, declined, expired. The

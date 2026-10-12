@@ -440,6 +440,11 @@ async def _handle_subscription_active(sub: dict) -> None:
         await _handle_subscription_cancelled(sub)
         return
 
+    # Snapshot the user's prior active tier BEFORE we upsert so we can tell
+    # "first-time subscriber" (basic → paid → welcome_* email) apart from
+    # "existing subscriber changed plans" (lite → premium → membership_upgraded).
+    prior_tier = await _get_current_tier(user_id)
+
     await _upsert_active_membership(
         user_id=user_id,
         tier=tier,
@@ -452,11 +457,65 @@ async def _handle_subscription_active(sub: dict) -> None:
         last_invoice_status=status,
     )
 
+    # ---- Email + push notifications (scenarios 15-18 of the 2026-10-12 spec) ----
+    # Fire-and-forget. send_transactional_email handles its own audit +
+    # dedup and never raises. All welcome_* + membership_upgraded are
+    # intentionally EMAIL ONLY (not in NOTIFICATION_REGISTRY) per spec.
+    from transactional_email import send_transactional_email as _send_email
+    if prior_tier == "basic" and tier != "basic":
+        # First-time subscriber → welcome email for the specific tier
+        welcome_slug = {
+            "premium": "welcome_premium",
+            "premium-lite": "welcome_premium_lite",
+        }.get(tier)
+        if welcome_slug:
+            try:
+                await _send_email(user_id=user_id, template_slug=welcome_slug, dedup_window_hours=24)
+            except Exception as e:
+                logger.warning("[billing] welcome email failed for %s: %r", user_id, e)
+    elif prior_tier != "basic" and prior_tier != tier and tier != "basic":
+        # Existing subscriber swapped plans → "upgraded" email
+        try:
+            await _send_email(
+                user_id=user_id,
+                template_slug="membership_upgraded",
+                extra_vars={"new_plan_name": tier},
+                dedup_window_hours=24,
+            )
+        except Exception as e:
+            logger.warning("[billing] upgraded email failed for %s: %r", user_id, e)
+
+
+async def _get_current_tier(user_id: str) -> str:
+    """Snapshot the user's currently-active membership tier so webhook
+    handlers can tell "first subscription" vs "plan change". Falls back
+    to 'basic' when there's no active row — same semantic the matching
+    quota code uses."""
+    try:
+        rows = await supabase.select(
+            "user_memberships",
+            params={
+                "select": "tier",
+                "user_id": f"eq.{user_id}",
+                "is_active": "eq.true",
+                "limit": "1",
+            },
+        )
+        if rows and rows[0].get("tier"):
+            return rows[0]["tier"]
+    except Exception:
+        pass
+    return "basic"
+
 
 async def _handle_subscription_cancelled(sub: dict) -> None:
     user_id = _user_id_from_object(sub)
     if not user_id:
         return
+    # Capture prior tier BEFORE we flip them to basic — so the email
+    # copy can reference what they had.
+    prior_tier = await _get_current_tier(user_id)
+
     # Drop them back to the free tier.
     await _upsert_active_membership(
         user_id=user_id,
@@ -470,11 +529,70 @@ async def _handle_subscription_cancelled(sub: dict) -> None:
         last_invoice_status="canceled",
     )
 
+    # Scenarios 21 (membership_cancelled) + 22 (premium_ended) of the
+    # 2026-10-12 spec: email + push. Both templates are in the
+    # NOTIFICATION_REGISTRY so push auto-fires alongside email. We fire
+    # cancellation now (confirms the action); the expiration email is
+    # fired separately by the sweep that detects current_period_end
+    # elapsed — not here, since Stripe may give the user grace until
+    # the period actually ends.
+    from transactional_email import send_transactional_email as _send_email
+    if prior_tier != "basic":
+        try:
+            await _send_email(
+                user_id=user_id,
+                template_slug="membership_cancelled",
+                extra_vars={"prior_tier": prior_tier},
+                dedup_window_hours=24,
+            )
+        except Exception as e:
+            logger.warning("[billing] cancellation email failed for %s: %r", user_id, e)
+
 
 async def _handle_invoice(inv: dict, *, status: str) -> None:
     sub_id = inv.get("subscription")
     if not sub_id:
         return
+
+    # Scenarios 19 (payment_successful) + 20 (payment_failed) of the
+    # 2026-10-12 spec: EMAIL ONLY. We fire these from the Stripe
+    # invoice.payment_succeeded / invoice.payment_failed events.
+    # payment_* slugs are intentionally OMITTED from NOTIFICATION_REGISTRY
+    # so no push fires. Billing emails are permanent records the user
+    # should refer back to, not transient push alerts.
+    try:
+        # Look up the user_id for this subscription so we can email them.
+        rows = await supabase.select(
+            "user_memberships",
+            params={
+                "select": "user_id",
+                "stripe_subscription_id": f"eq.{sub_id}",
+                "is_active": "eq.true",
+                "limit": "1",
+            },
+        )
+        user_id = rows[0]["user_id"] if rows else None
+        if user_id:
+            from transactional_email import send_transactional_email as _send_email
+            amount = (inv.get("amount_paid") or inv.get("amount_due") or 0) / 100.0
+            currency = (inv.get("currency") or "usd").upper()
+            template_slug = "payment_successful" if status == "paid" else "payment_failed"
+            try:
+                await _send_email(
+                    user_id=user_id,
+                    template_slug=template_slug,
+                    extra_vars={
+                        "amount": f"{amount:.2f}",
+                        "currency": currency,
+                        "invoice_url": inv.get("hosted_invoice_url") or "",
+                    },
+                    dedup_window_hours=0,  # each invoice is a distinct event
+                )
+            except Exception as e:
+                logger.warning("[billing] %s email failed for %s: %r", template_slug, user_id, e)
+    except Exception as e:
+        logger.warning("[billing] invoice-side email lookup failed: %r", e)
+
     try:
         await supabase.update(
             "user_memberships",
