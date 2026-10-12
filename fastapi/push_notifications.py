@@ -214,8 +214,13 @@ async def send_push_notification(
             logger.warning("[push] url normalize failed: %r — stripping url entirely so send proceeds", e)
             url = None
 
+    # Global dedup kill-switch — mirrors transactional_email path.
+    # Testing mode (communication_live=false) → always send, no window.
+    from app_config import get_bool
+    live = await get_bool("communication_live", default=False)
+
     async with httpx.AsyncClient() as client:
-        if await _already_pushed_recently(
+        if live and await _already_pushed_recently(
             client, user_id, campaign, dedup_window_hours,
             related_user_id=related_user_id,
         ):

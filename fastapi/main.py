@@ -17,7 +17,7 @@ Run:
 import os
 import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional, List
 from contextlib import asynccontextmanager
 import asyncio
@@ -1636,6 +1636,91 @@ async def admin_invalidate_app_config_cache(
     logger.info("[app-config-cache] invalidated by admin=%s", admin_user_id)
     invalidate_config_cache()
     return {"ok": True}
+
+
+class WipeDedupQueueRequest(BaseModel):
+    """Body for /admin/wipe-dedup-queue.
+
+    scope controls what gets cleared:
+      - "all": every sent_emails + sent_push row (full reset — the dedup
+        windows see no history and the next send to any user+campaign
+        counts as fresh)
+      - "recent": only the last N hours of rows (defaults to 24h so a
+        testing session can be wiped without losing older audit data)
+    """
+    scope: str = "recent"  # "all" | "recent"
+    hours: int = 24
+    user_id: str | None = None  # optional: wipe only this user's rows
+
+
+@app.post("/admin/wipe-dedup-queue", tags=["Admin"])
+async def admin_wipe_dedup_queue(
+    req: WipeDedupQueueRequest,
+    admin_user_id: str = Depends(get_current_admin_id),
+):
+    """
+    Clear dedup-audit history so the next notification send fires fresh.
+
+    Used during testing when `communication_live=true` is suppressing
+    repeated test runs — flip the toggle and wipe the queue (or just
+    wipe) and the next send to any (user, campaign, related_user_id)
+    is treated as never-before-sent.
+
+    Does NOT delete the user's in-app notifications or anything the
+    user sees — only the backend dedup audit tables (sent_emails and
+    sent_push). Nothing user-visible is lost.
+    """
+    scope = (req.scope or "recent").lower().strip()
+    if scope not in ("all", "recent"):
+        return {"ok": False, "error": "scope must be 'all' or 'recent'"}
+
+    logger.info(
+        "[wipe-dedup-queue] admin=%s scope=%s hours=%s user=%s",
+        admin_user_id, scope, req.hours, req.user_id,
+    )
+
+    deleted = {"sent_emails": 0, "sent_push": 0}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            # DELETE requires at least one filter in PostgREST, so for
+            # "all" we filter on sent_at >= epoch which matches every row.
+            if scope == "all":
+                filters = {"sent_at": "gte.1970-01-01T00:00:00Z"}
+            else:
+                cutoff = (
+                    datetime.now(timezone.utc) - timedelta(hours=max(1, req.hours))
+                ).isoformat()
+                filters = {"sent_at": f"gte.{cutoff}"}
+            if req.user_id:
+                filters["user_id"] = f"eq.{req.user_id}"
+
+            for table in ("sent_emails", "sent_push"):
+                resp = await client.delete(
+                    f"{SUPABASE_URL}/rest/v1/{table}",
+                    params=filters,
+                    headers={
+                        "apikey": SUPABASE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_KEY}",
+                        # count=exact so we get back how many rows went
+                        "Prefer": "count=exact,return=minimal",
+                    },
+                )
+                if resp.status_code >= 300:
+                    logger.error(
+                        "[wipe-dedup-queue] %s delete failed [%s]: %s",
+                        table, resp.status_code, resp.text[:200],
+                    )
+                    continue
+                content_range = resp.headers.get("content-range") or ""
+                try:
+                    deleted[table] = int(content_range.split("/")[-1])
+                except Exception:
+                    deleted[table] = -1
+    except Exception as e:
+        logger.error("[wipe-dedup-queue] failed: %r", e, exc_info=True)
+        return {"ok": False, "exception": str(e)}
+
+    return {"ok": True, "deleted": deleted}
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])

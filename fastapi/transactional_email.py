@@ -72,6 +72,21 @@ async def _fetch_recipient(client: httpx.AsyncClient, user_id: str) -> dict[str,
     return rows[0] if rows else None
 
 
+async def _communication_live() -> bool:
+    """
+    Global dedup kill-switch (app_config key: communication_live).
+    Default FALSE while testing — every send fires immediately,
+    nothing is suppressed. Flip to TRUE in prod via the admin panel
+    (or set COMMUNICATION_LIVE=true in Railway env) so the normal
+    per-pair dedup windows apply.
+
+    Read via the 60-second cached app_config layer, so flipping the
+    admin toggle propagates within a minute without a redeploy.
+    """
+    from app_config import get_bool
+    return await get_bool("communication_live", default=False)
+
+
 async def _already_sent_recently(
     client: httpx.AsyncClient,
     user_id: str,
@@ -192,8 +207,11 @@ async def send_transactional_email(
             or recipient.split("@")[0]
         )
 
-        # 2. Dedup (per-pair when related_user_id is provided)
-        if await _already_sent_recently(
+        # 2. Dedup (per-pair when related_user_id is provided). Entirely
+        # skipped while communication_live=false (testing mode) so every
+        # send fires immediately. Flip the admin toggle (or set
+        # COMMUNICATION_LIVE=true env) to enable the normal windows.
+        if await _communication_live() and await _already_sent_recently(
             client, user_id, template_slug, dedup_window_hours,
             related_user_id=related_user_id,
         ):
