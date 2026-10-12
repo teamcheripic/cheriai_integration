@@ -267,6 +267,7 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                         "other_user_id": other,
                     },
                     dedup_window_hours=24,
+                    related_user_id=other,
                 )
 
         # ---- 3. Sweep side matches for both partners ----
@@ -364,6 +365,7 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                                 ),
                             },
                             dedup_window_hours=24,
+                            related_user_id=uid,
                         )
                         # Push auto-fires via NOTIFICATION_REGISTRY (connection_lost).
 
@@ -386,18 +388,25 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                 ),
             },
         )
-        pending_third_parties: set[str] = set()
+        # Keep tp → partner_uid so the related_user_id passed to
+        # send_transactional_email scopes dedup per-pair. If a tp had
+        # pending requests touching BOTH partners, either one is a
+        # fine key — they only need one connection_lost email per
+        # losing event.
+        pending_third_party_pair: dict[str, str] = {}
         for r in pending_touching_partners:
             s_id, r_id = r.get("sender_id"), r.get("receiver_id")
-            # The "third party" is whichever side ISN'T a partner.
-            if s_id and s_id not in partner_ids:
-                pending_third_parties.add(s_id)
-            if r_id and r_id not in partner_ids:
-                pending_third_parties.add(r_id)
+            # The "third party" is whichever side ISN'T a partner;
+            # the "partner uid" is the other side of the row.
+            if s_id and s_id not in partner_ids and r_id in partner_ids:
+                pending_third_party_pair.setdefault(s_id, r_id)
+            if r_id and r_id not in partner_ids and s_id in partner_ids:
+                pending_third_party_pair.setdefault(r_id, s_id)
         # Skip anyone we already emailed in step 3 (mutual match path);
         # that email already covered them.
-        pending_third_parties -= third_parties_notified
-        for tp in pending_third_parties:
+        for tp in third_parties_notified:
+            pending_third_party_pair.pop(tp, None)
+        for tp, partner_uid in pending_third_party_pair.items():
             await send_transactional_email(
                 user_id=tp,
                 template_slug="connection_lost",
@@ -408,6 +417,7 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                     ),
                 },
                 dedup_window_hours=24,
+                related_user_id=partner_uid,
             )
             # Push auto-fires via NOTIFICATION_REGISTRY (connection_lost).
 

@@ -59,21 +59,38 @@ _PG_HEADERS = {
 
 
 async def _already_pushed_recently(
-    client: httpx.AsyncClient, user_id: str, campaign: str, hours: int
+    client: httpx.AsyncClient,
+    user_id: str,
+    campaign: str,
+    hours: int,
+    related_user_id: str | None = None,
 ) -> bool:
-    """Dedup — has this (user_id, campaign) push been sent in the last `hours`?"""
+    """
+    Dedup — has this (user_id, campaign) push been sent in the last `hours`?
+
+    Per-pair variant (migration 039): when `related_user_id` is set the
+    window is scoped to that specific pair, so a popular receiver still
+    gets push from each distinct sender while rapid-fire same-pair
+    attempts are suppressed. Omitting it falls back to per-(user,campaign)
+    dedup matching rows where related_user_id IS NULL.
+    """
     if hours <= 0:
         return False
+    params = {
+        "select": "sent_at",
+        "user_id": f"eq.{user_id}",
+        "campaign": f"eq.{campaign}",
+        "status": "eq.sent",
+        "order": "sent_at.desc",
+        "limit": "1",
+    }
+    if related_user_id:
+        params["related_user_id"] = f"eq.{related_user_id}"
+    else:
+        params["related_user_id"] = "is.null"
     resp = await client.get(
         f"{_PG_BASE}/sent_push",
-        params={
-            "select": "sent_at",
-            "user_id": f"eq.{user_id}",
-            "campaign": f"eq.{campaign}",
-            "status": "eq.sent",
-            "order": "sent_at.desc",
-            "limit": "1",
-        },
+        params=params,
         headers=_PG_HEADERS,
         timeout=10.0,
     )
@@ -98,19 +115,23 @@ async def _record_push_send(
     title: str,
     provider_id: str | None,
     status: str,
+    related_user_id: str | None = None,
 ) -> None:
     """Write an audit row. Best-effort; never raises."""
     try:
+        row: dict[str, Any] = {
+            "user_id": user_id,
+            "campaign": campaign,
+            "title": title,
+            "provider": "onesignal",
+            "provider_id": provider_id,
+            "status": status,
+        }
+        if related_user_id:
+            row["related_user_id"] = related_user_id
         resp = await client.post(
             f"{_PG_BASE}/sent_push",
-            json={
-                "user_id": user_id,
-                "campaign": campaign,
-                "title": title,
-                "provider": "onesignal",
-                "provider_id": provider_id,
-                "status": status,
-            },
+            json=row,
             headers={**_PG_HEADERS, "Prefer": "return=minimal"},
             timeout=10.0,
         )
@@ -132,6 +153,7 @@ async def send_push_notification(
     data: dict[str, Any] | None = None,
     url: str | None = None,
     dedup_window_hours: int = 1,
+    related_user_id: str | None = None,
 ) -> bool:
     """
     Send a push to every device subscribed to this user via OneSignal.
@@ -155,6 +177,11 @@ async def send_push_notification(
       dedup_window_hours — skip if the same (user_id, campaign) push
         was already sent inside this window. Default 1h. Set 0 to
         disable dedup for a one-off (rare).
+      related_user_id — the "other party" for interpersonal scenarios
+        (sender for interest_received, caller for partner_proposal,
+        etc.). When set, dedup is scoped to this exact pair instead
+        of per-(user, campaign). Omit for broadcasts, celebration
+        emails, and anything that has no counterparty.
     """
     if not ONESIGNAL_APP_ID or not ONESIGNAL_REST_API_KEY:
         logger.info("[push] ONESIGNAL env not configured — skipping push for %s", user_id)
@@ -188,10 +215,13 @@ async def send_push_notification(
             url = None
 
     async with httpx.AsyncClient() as client:
-        if await _already_pushed_recently(client, user_id, campaign, dedup_window_hours):
+        if await _already_pushed_recently(
+            client, user_id, campaign, dedup_window_hours,
+            related_user_id=related_user_id,
+        ):
             logger.info(
-                "[push] skipping %s to %s — pushed in last %dh",
-                campaign, user_id, dedup_window_hours,
+                "[push] skipping %s to %s — pushed in last %dh (pair=%s)",
+                campaign, user_id, dedup_window_hours, related_user_id or "n/a",
             )
             return False
 
@@ -229,7 +259,10 @@ async def send_push_notification(
             )
         except Exception as e:
             logger.warning("[push] send threw for %s: %r", user_id, e)
-            await _record_push_send(client, user_id, campaign, title, None, "failed")
+            await _record_push_send(
+                client, user_id, campaign, title, None, "failed",
+                related_user_id=related_user_id,
+            )
             return False
 
         provider_id: str | None = None
@@ -251,6 +284,7 @@ async def send_push_notification(
             title=title,
             provider_id=provider_id,
             status="sent" if ok else "failed",
+            related_user_id=related_user_id,
         )
 
         if ok:

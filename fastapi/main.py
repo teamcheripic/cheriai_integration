@@ -959,6 +959,7 @@ async def matching_notify_interest_received(
             template_slug="interest_received",
             extra_vars={"other_name": sender_label},
             dedup_window_hours=2,
+            related_user_id=caller_user_id,
         )
     except Exception as e:
         # Log but never surface — the fire-and-forget contract is
@@ -1106,6 +1107,7 @@ async def matching_notify_partner_proposal(
                 "other_user_id": caller_user_id,
             },
             dedup_window_hours=2,
+            related_user_id=caller_user_id,
         )
     except Exception as e:
         logger.error("[partner-proposal] notify failed: %r", e, exc_info=True)
@@ -1290,6 +1292,7 @@ async def matching_notify_interest_responded(
             template_slug=template_slug,
             extra_vars={"other_name": other_label},
             dedup_window_hours=2,
+            related_user_id=caller_user_id,
         )
     except Exception as e:
         logger.error("[interest-responded] failed: %r", e, exc_info=True)
@@ -1343,6 +1346,7 @@ async def matching_notify_partner_proposal_declined(
             template_slug="partner_proposal_declined",
             extra_vars={"other_name": caller_label},
             dedup_window_hours=2,
+            related_user_id=caller_user_id,
         )
     except Exception as e:
         logger.error("[proposal-declined] failed: %r", e, exc_info=True)
@@ -1405,6 +1409,7 @@ async def chat_notify_unread_message(
             campaign="red_room_message_unread",
             url=f"/#/chat/{caller_user_id}",
             dedup_window_hours=1,
+            related_user_id=caller_user_id,
         )
     except Exception as e:
         logger.error("[chat-notify-unread] failed: %r", e, exc_info=True)

@@ -73,21 +73,40 @@ async def _fetch_recipient(client: httpx.AsyncClient, user_id: str) -> dict[str,
 
 
 async def _already_sent_recently(
-    client: httpx.AsyncClient, user_id: str, campaign: str, hours: int
+    client: httpx.AsyncClient,
+    user_id: str,
+    campaign: str,
+    hours: int,
+    related_user_id: str | None = None,
 ) -> bool:
-    """Dedup check — has this campaign been delivered to this user recently?"""
+    """
+    Dedup check — has this campaign been delivered to this user recently?
+
+    Per-pair variant (migration 039): when `related_user_id` is provided,
+    the window is scoped to (user_id, campaign, related_user_id) so a
+    popular receiver who gets interests from several senders in the
+    same window sees each one — only RE-SENDS from the SAME sender get
+    suppressed. When `related_user_id` is None (welcome_*, payment_*,
+    assessment_completed), falls back to the legacy per-(user,campaign)
+    dedup, matching rows where related_user_id IS NULL.
+    """
     if hours <= 0:
         return False
+    params = {
+        "select": "sent_at",
+        "user_id": f"eq.{user_id}",
+        "campaign": f"eq.{campaign}",
+        "status": "eq.sent",
+        "order": "sent_at.desc",
+        "limit": "1",
+    }
+    if related_user_id:
+        params["related_user_id"] = f"eq.{related_user_id}"
+    else:
+        params["related_user_id"] = "is.null"
     resp = await client.get(
         f"{_PG_BASE}/sent_emails",
-        params={
-            "select": "sent_at",
-            "user_id": f"eq.{user_id}",
-            "campaign": f"eq.{campaign}",
-            "status": "eq.sent",
-            "order": "sent_at.desc",
-            "limit": "1",
-        },
+        params=params,
         headers=_PG_HEADERS,
         timeout=10.0,
     )
@@ -112,18 +131,22 @@ async def _record_send(
     subject: str,
     provider_id: str | None,
     status: str,
+    related_user_id: str | None = None,
 ) -> None:
+    payload: dict[str, Any] = {
+        "user_id": user_id,
+        "email": email,
+        "campaign": campaign,
+        "subject": subject,
+        "provider": "resend",
+        "provider_id": provider_id,
+        "status": status,
+    }
+    if related_user_id:
+        payload["related_user_id"] = related_user_id
     resp = await client.post(
         f"{_PG_BASE}/sent_emails",
-        json={
-            "user_id": user_id,
-            "email": email,
-            "campaign": campaign,
-            "subject": subject,
-            "provider": "resend",
-            "provider_id": provider_id,
-            "status": status,
-        },
+        json=payload,
         headers={**_PG_HEADERS, "Prefer": "return=minimal"},
         timeout=10.0,
     )
@@ -136,6 +159,7 @@ async def send_transactional_email(
     template_slug: str,
     extra_vars: dict[str, Any] | None = None,
     dedup_window_hours: int = 1,
+    related_user_id: str | None = None,
 ) -> bool:
     """
     Send `template_slug` to `user_id`. Returns True on success, False on
@@ -168,11 +192,14 @@ async def send_transactional_email(
             or recipient.split("@")[0]
         )
 
-        # 2. Dedup
-        if await _already_sent_recently(client, user_id, template_slug, dedup_window_hours):
+        # 2. Dedup (per-pair when related_user_id is provided)
+        if await _already_sent_recently(
+            client, user_id, template_slug, dedup_window_hours,
+            related_user_id=related_user_id,
+        ):
             logger.info(
-                "[transactional_email] skipping %s to %s — sent in last %dh",
-                template_slug, user_id, dedup_window_hours,
+                "[transactional_email] skipping %s to %s (related=%s) — sent in last %dh",
+                template_slug, user_id, related_user_id, dedup_window_hours,
             )
             return False
 
@@ -212,6 +239,7 @@ async def send_transactional_email(
             subject=subject,
             provider_id=provider_id,
             status="sent" if ok else "failed",
+            related_user_id=related_user_id,
         )
         if ok:
             logger.info(
@@ -248,6 +276,7 @@ async def send_transactional_email(
                     campaign=template_slug,
                     url=url,
                     dedup_window_hours=push_cfg.get("dedup_window_hours", 1),
+                    related_user_id=related_user_id,
                 )
         except Exception as e:
             logger.warning(
