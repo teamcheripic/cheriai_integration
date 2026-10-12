@@ -221,16 +221,9 @@ async def send_transactional_email(
             )
             return False
 
-        # 3. Load template
-        template = await _load_template(template_slug)
-        if not template:
-            logger.warning(
-                "[transactional_email] template '%s' missing — apply migration 022",
-                template_slug,
-            )
-            return False
-
-        # 4. Assemble context
+        # 4. Assemble context — always, even if the email template is
+        # missing. The context is also used to render the companion push
+        # title/body/url, so missing-template must not block push.
         app_base = await _cfg_app_base_url()
         ctx: dict[str, Any] = {
             "name": display_name,
@@ -242,40 +235,54 @@ async def send_transactional_email(
         if extra_vars:
             ctx.update({k: ("" if v is None else str(v)) for k, v in extra_vars.items()})
 
-        # 5. Render
-        subject = _apply_template_vars(template["subject"], ctx)
-        html = _apply_template_vars(template["html_body"], ctx)
-        text = _apply_template_vars(template.get("text_body") or "", ctx)
-
-        # 6. Send + audit
-        ok, provider_id = await send_email(client, recipient, subject, html, text)
-        await _record_send(
-            client,
-            user_id=user_id,
-            email=recipient,
-            campaign=template_slug,
-            subject=subject,
-            provider_id=provider_id,
-            status="sent" if ok else "failed",
-            related_user_id=related_user_id,
-        )
-        if ok:
-            logger.info(
-                "[transactional_email] sent %s to %s (%s) resend_id=%s",
-                template_slug, user_id, recipient, provider_id,
+        # 3+5+6. Load template, render, send + audit. If the template
+        # row is missing we SKIP the email send but still fall through
+        # to the companion push below — push is an independent channel
+        # and must not be killed by an email-side config miss.
+        # Reported 2026-10-12: interest_received had no email_templates
+        # row, so the whole function returned early at template load
+        # and the receiver got no push either.
+        template = await _load_template(template_slug)
+        email_ok = False
+        if not template:
+            logger.warning(
+                "[transactional_email] template '%s' missing — email skipped; "
+                "companion push still runs. Add the row to email_templates "
+                "if an email is desired for this slug.",
+                template_slug,
             )
         else:
-            logger.warning(
-                "[transactional_email] send failed for %s to %s",
-                template_slug, user_id,
+            subject = _apply_template_vars(template["subject"], ctx)
+            html = _apply_template_vars(template["html_body"], ctx)
+            text = _apply_template_vars(template.get("text_body") or "", ctx)
+            email_ok, provider_id = await send_email(client, recipient, subject, html, text)
+            await _record_send(
+                client,
+                user_id=user_id,
+                email=recipient,
+                campaign=template_slug,
+                subject=subject,
+                provider_id=provider_id,
+                status="sent" if email_ok else "failed",
+                related_user_id=related_user_id,
             )
+            if email_ok:
+                logger.info(
+                    "[transactional_email] sent %s to %s (%s) resend_id=%s",
+                    template_slug, user_id, recipient, provider_id,
+                )
+            else:
+                logger.warning(
+                    "[transactional_email] send failed for %s to %s",
+                    template_slug, user_id,
+                )
 
         # ---- Companion push notification ------------------------------------
         # 2026-10-12 refactor: channel decisions live in NOTIFICATION_REGISTRY
-        # below. If the slug has a push_config, we fire push after email so
-        # every call site that already emails ALSO pushes — zero per-site
-        # code changes. Slugs NOT in the registry stay email-only (welcome_*,
-        # payment_*, membership_upgraded, assessment_completed, etc).
+        # below. If the slug has a push_config, we fire push regardless of
+        # email outcome so every call site that registers both channels
+        # delivers both — a missing email template or a Resend outage must
+        # not silence push too.
         try:
             push_cfg = NOTIFICATION_REGISTRY.get(template_slug)
             if push_cfg is not None:
@@ -302,7 +309,11 @@ async def send_transactional_email(
                 template_slug, user_id, e,
             )
 
-        return ok
+        # Return value reflects email outcome specifically — callers that
+        # care about push outcome should read Railway logs or sent_push.
+        if not template:
+            return False
+        return email_ok
 
 
 # =============================================================================
