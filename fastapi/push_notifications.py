@@ -220,6 +220,38 @@ async def send_push_notification(
     live = await get_bool("communication_live", default=False)
 
     async with httpx.AsyncClient() as client:
+        # Per-member push preference (migration 043). The direct-push
+        # path (e.g. /chat/notify-unread-message) bypasses
+        # send_transactional_email, so we have to check here too. The
+        # email path checks via its own _fetch_recipient. Default to
+        # enabled when the row is missing or the column is NULL.
+        try:
+            pref_resp = await client.get(
+                f"{_PG_BASE}/user_profiles",
+                params={
+                    "select": "notify_push_enabled",
+                    "user_id": f"eq.{user_id}",
+                    "limit": "1",
+                },
+                headers=_PG_HEADERS,
+                timeout=5.0,
+            )
+            if pref_resp.status_code < 300:
+                rows = pref_resp.json()
+                if rows:
+                    pref = rows[0].get("notify_push_enabled")
+                    if pref is not None and not pref:
+                        logger.info(
+                            "[push] skipped %s to %s — member opted out of push",
+                            campaign, user_id,
+                        )
+                        return False
+        except Exception as e:
+            # Fail-open: never silence pushes because the preference
+            # lookup had a hiccup. If the member truly turned push off
+            # we'd rather over-send once than silently drop deliveries.
+            logger.warning("[push] preference lookup failed for %s: %r — proceeding", user_id, e)
+
         if live and await _already_pushed_recently(
             client, user_id, campaign, dedup_window_hours,
             related_user_id=related_user_id,

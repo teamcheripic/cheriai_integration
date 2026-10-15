@@ -60,10 +60,21 @@ _PG_HEADERS = {
 
 
 async def _fetch_recipient(client: httpx.AsyncClient, user_id: str) -> dict[str, Any] | None:
-    """Return {email, nick_name, full_name} or None."""
+    """
+    Return {email, nick_name, full_name, notify_email_enabled, notify_push_enabled}
+    or None.
+
+    The two notify_* flags are member-controlled from Profile → Communication
+    Preferences (migration 043). Both default TRUE in the DB; a NULL value
+    (shouldn't exist post-migration but defensive) is treated as enabled.
+    """
     resp = await client.get(
         f"{_PG_BASE}/user_profiles",
-        params={"select": "email,nick_name,full_name", "user_id": f"eq.{user_id}", "limit": "1"},
+        params={
+            "select": "email,nick_name,full_name,notify_email_enabled,notify_push_enabled",
+            "user_id": f"eq.{user_id}",
+            "limit": "1",
+        },
         headers=_PG_HEADERS,
         timeout=10.0,
     )
@@ -206,6 +217,12 @@ async def send_transactional_email(
             or profile.get("full_name")
             or recipient.split("@")[0]
         )
+        # Member communication preferences (migration 043). Both default
+        # TRUE server-side and NULL is treated as TRUE for safety.
+        email_pref_on = profile.get("notify_email_enabled")
+        email_pref_on = True if email_pref_on is None else bool(email_pref_on)
+        push_pref_on = profile.get("notify_push_enabled")
+        push_pref_on = True if push_pref_on is None else bool(push_pref_on)
 
         # 2. Dedup (per-pair when related_user_id is provided). Entirely
         # skipped while communication_live=false (testing mode) so every
@@ -244,7 +261,15 @@ async def send_transactional_email(
         # and the receiver got no push either.
         template = await _load_template(template_slug)
         email_ok = False
-        if not template:
+        if not email_pref_on:
+            # Member opted out of email. Skip email entirely; the
+            # companion push below still runs if push_pref_on is True —
+            # the two channels are independent member choices.
+            logger.info(
+                "[transactional_email] email skipped for %s (slug=%s) — member opted out of email",
+                user_id, template_slug,
+            )
+        elif not template:
             logger.warning(
                 "[transactional_email] template '%s' missing — email skipped; "
                 "companion push still runs. Add the row to email_templates "
@@ -304,7 +329,12 @@ async def send_transactional_email(
         # not silence push too.
         try:
             push_cfg = NOTIFICATION_REGISTRY.get(template_slug)
-            if push_cfg is not None:
+            if push_cfg is not None and not push_pref_on:
+                logger.info(
+                    "[transactional_email] push skipped for %s (slug=%s) — member opted out of push",
+                    user_id, template_slug,
+                )
+            elif push_cfg is not None:
                 # Lazy import so transactional_email.py doesn't require the
                 # push module when ONESIGNAL env isn't set — push_notifications
                 # itself early-returns False in that case.
@@ -375,8 +405,8 @@ NOTIFICATION_REGISTRY: dict[str, dict[str, Any]] = {
         "dedup_window_hours": 1,
     },
     "partner_proposal_accepted": {
-        "title": "You and {{other_name}} are official 💞",
-        "body":  "New introductions paused. Tap to open your Red Room.",
+        "title": "You and {{other_name}} are now partners 💞",
+        "body":  "{{other_name}} accepted your official request. Tap to open your Red Room.",
         "url":   "/#/chat/{{other_user_id}}",
         "dedup_window_hours": 24,
     },
