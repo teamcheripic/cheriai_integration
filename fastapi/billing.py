@@ -34,6 +34,10 @@ from supabase_client import supabase
 
 logger = logging.getLogger(__name__)
 
+class WebhookSignatureError(Exception):
+    """Stripe webhook payload/signature could not be verified (→ HTTP 400)."""
+
+
 # Lazy-imported so the module loads even if stripe isn't pip-installed yet
 # (we only crash when an endpoint is actually called).
 _stripe = None
@@ -314,8 +318,11 @@ async def handle_event(payload: bytes, signature: str) -> dict:
         )
     except (ValueError, stripe.error.SignatureVerificationError) as e:
         logger.error("Invalid Stripe webhook signature: %s", e)
-        raise
+        raise WebhookSignatureError(str(e)) from e
 
+    # stripe-python >= 15 returns StripeObject, which is no longer a dict
+    # (`.get` raises AttributeError) — every handler below uses dict access.
+    event = _plain(event)
     event_id = event["id"]
     event_type = event["type"]
 
@@ -324,9 +331,25 @@ async def handle_event(payload: bytes, signature: str) -> dict:
 
     obj = event["data"]["object"]
     handled = False
+    failed = False
+    stale = False
+    # H13.17 · out-of-order delivery: remember which subscription this event
+    # is about and when Stripe created it; an event older than the newest one
+    # already applied for that subscription must not regress state.
+    sub_ref = _subscription_ref(event_type, obj)
+    created = _as_int(event.get("created"))
+    if sub_ref and created is not None:
+        last_applied = await _last_applied_event_created(sub_ref)
+        if last_applied is not None and created < last_applied:
+            stale = True
 
     try:
-        if event_type == "checkout.session.completed":
+        if stale:
+            logger.info(
+                "Ignoring out-of-order Stripe event %s (%s): older than last applied for its subscription",
+                event_id, event_type,
+            )
+        elif event_type == "checkout.session.completed":
             await _handle_checkout_completed(obj)
             handled = True
         elif event_type in (
@@ -346,22 +369,133 @@ async def handle_event(payload: bytes, signature: str) -> dict:
             handled = True
         else:
             logger.info("Ignoring Stripe event type %s", event_type)
-    finally:
-        # Mark processed even on failure so we don't loop on a poison message
-        # — manual intervention via stripe_events.notes is the recovery path.
+    except Exception:
+        # Processing failed (e.g. Supabase blip). Release the idempotency
+        # claim so Stripe's automatic retry reprocesses this event instead of
+        # it being skipped forever as a "duplicate" — otherwise a transient
+        # error permanently loses a membership change. Stripe stops retrying
+        # after ~3 days, which bounds any poison message.
+        failed = True
         try:
-            await supabase.update(
-                "stripe_events",
-                payload={
-                    "processed_at": datetime.now(timezone.utc).isoformat(),
-                    "notes": None if handled else "unhandled or errored",
-                },
-                eq={"event_id": event_id},
-            )
-        except Exception:
-            pass
+            await supabase.delete("stripe_events", eq={"event_id": event_id})
+        except Exception as e:
+            logger.error("Could not release stripe_events claim for %s: %r", event_id, e)
+        raise
+    finally:
+        if not failed:
+            try:
+                if stale:
+                    notes = "stale: older than last applied event"
+                elif handled and sub_ref and created is not None:
+                    # Machine-readable marker read back by
+                    # _last_applied_event_created (no schema change needed).
+                    notes = f"{_APPLIED_PREFIX}{sub_ref} created={created}"
+                else:
+                    notes = None if handled else "unhandled event type"
+                await supabase.update(
+                    "stripe_events",
+                    payload={
+                        "processed_at": datetime.now(timezone.utc).isoformat(),
+                        "notes": notes,
+                    },
+                    eq={"event_id": event_id},
+                )
+            except Exception:
+                pass
 
-    return {"event_id": event_id, "event_type": event_type, "handled": handled}
+    out = {"event_id": event_id, "event_type": event_type, "handled": handled}
+    if stale:
+        out["status"] = "stale"
+    return out
+
+
+# -----------------------------------------------------------------------------
+# H13.17 · event ordering + reconciliation helpers
+# -----------------------------------------------------------------------------
+_APPLIED_PREFIX = "applied sub="
+_SUBSCRIPTION_EVENTS = (
+    "customer.subscription.created",
+    "customer.subscription.updated",
+    "customer.subscription.deleted",
+    "checkout.session.completed",
+)
+
+
+def _plain(obj):
+    """StripeObject → plain dict (recursive); dicts pass through."""
+    to_dict = getattr(obj, "to_dict", None)
+    if callable(to_dict) and not isinstance(obj, dict):
+        try:
+            return to_dict()
+        except TypeError:
+            return to_dict(recursive=True)
+    return obj
+
+
+def _as_int(v) -> Optional[int]:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _subscription_ref(event_type: str, obj: dict) -> Optional[str]:
+    """Subscription id an ordering-sensitive event is about (or None)."""
+    if event_type not in _SUBSCRIPTION_EVENTS:
+        return None
+    if event_type == "checkout.session.completed":
+        sid = obj.get("subscription")
+    else:
+        sid = obj.get("id")
+    return sid if isinstance(sid, str) and sid else None
+
+
+async def _last_applied_event_created(sub_id: str) -> Optional[int]:
+    """Newest Stripe `created` (epoch s) already applied for this
+    subscription, read from the stripe_events notes marker. None when
+    unknown — then the event is applied (pre-existing behaviour)."""
+    import httpx
+    from supabase_client import SUPABASE_URL, SUPABASE_KEY
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/stripe_events",
+                params={
+                    "select": "notes",
+                    "notes": f"like.{_APPLIED_PREFIX}{sub_id} created=*",
+                    "processed_at": "not.is.null",
+                },
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+            )
+        if r.status_code >= 300:
+            return None
+        best: Optional[int] = None
+        for row in r.json() or []:
+            note = row.get("notes") or ""
+            if not note.startswith(f"{_APPLIED_PREFIX}{sub_id} created="):
+                continue
+            ts = _as_int(note.rsplit("=", 1)[-1])
+            if ts is not None and (best is None or ts > best):
+                best = ts
+        return best
+    except Exception as e:
+        logger.warning("[billing] last-applied lookup failed for %s: %r", sub_id, e)
+        return None
+
+
+def _period_bounds(sub: dict) -> tuple[Optional[datetime], Optional[datetime]]:
+    """current_period_start/end as datetimes. Newer Stripe API versions
+    carry them on the subscription item instead of the subscription."""
+    cps = sub.get("current_period_start")
+    cpe = sub.get("current_period_end")
+    if cps is None or cpe is None:
+        items = (sub.get("items") or {}).get("data") or []
+        if items:
+            cps = cps if cps is not None else items[0].get("current_period_start")
+            cpe = cpe if cpe is not None else items[0].get("current_period_end")
+    to_dt = lambda v: datetime.fromtimestamp(v, tz=timezone.utc) if v else None  # noqa: E731
+    return to_dt(cps), to_dt(cpe)
 
 
 def _user_id_from_object(obj: dict) -> Optional[str]:
@@ -396,6 +530,7 @@ async def _handle_checkout_completed(session: dict) -> None:
         except Exception as e:
             logger.warning("Could not retrieve sub %s right away: %s", sub_id, e)
     if tier:
+        prior_tier = await _get_current_tier(user_id)
         await _upsert_active_membership(
             user_id=user_id,
             tier=tier,
@@ -403,6 +538,7 @@ async def _handle_checkout_completed(session: dict) -> None:
             stripe_subscription_id=sub_id,
             stripe_price_id=price_id,
         )
+        await _send_membership_change_email(user_id, prior_tier, tier)
 
 
 async def _handle_subscription_active(sub: dict) -> None:
@@ -413,7 +549,7 @@ async def _handle_subscription_active(sub: dict) -> None:
         if cust_id:
             try:
                 stripe = _get_stripe()
-                cust = stripe.Customer.retrieve(cust_id)
+                cust = _plain(stripe.Customer.retrieve(cust_id))
                 user_id = (cust.get("metadata") or {}).get("cheripic_user_id")
             except Exception:
                 pass
@@ -428,10 +564,7 @@ async def _handle_subscription_active(sub: dict) -> None:
         logger.warning("Unknown price_id %s on subscription %s", price_id, sub.get("id"))
         return
 
-    cps = sub.get("current_period_start")
-    cps_dt = datetime.fromtimestamp(cps, tz=timezone.utc) if cps else None
-    cpe = sub.get("current_period_end")
-    cpe_dt = datetime.fromtimestamp(cpe, tz=timezone.utc) if cpe else None
+    cps_dt, cpe_dt = _period_bounds(sub)
 
     status = sub.get("status")
     # 'active', 'trialing' → keep tier; 'past_due', 'unpaid', 'incomplete' → still
@@ -443,7 +576,9 @@ async def _handle_subscription_active(sub: dict) -> None:
     # Snapshot the user's prior active tier BEFORE we upsert so we can tell
     # "first-time subscriber" (basic → paid → welcome_* email) apart from
     # "existing subscriber changed plans" (lite → premium → membership_upgraded).
-    prior_tier = await _get_current_tier(user_id)
+    prior = await _get_current_membership(user_id)
+    prior_tier = prior["tier"]
+    cancel_at_period_end = bool(sub.get("cancel_at_period_end"))
 
     await _upsert_active_membership(
         user_id=user_id,
@@ -453,17 +588,41 @@ async def _handle_subscription_active(sub: dict) -> None:
         stripe_price_id=price_id,
         current_period_start=cps_dt,
         current_period_end=cpe_dt,
-        cancel_at_period_end=bool(sub.get("cancel_at_period_end")),
+        cancel_at_period_end=cancel_at_period_end,
         last_invoice_status=status,
     )
 
-    # ---- Email + push notifications (scenarios 15-18 of the 2026-10-12 spec) ----
-    # Fire-and-forget. send_transactional_email handles its own audit +
-    # dedup and never raises. All welcome_* + membership_upgraded are
-    # intentionally EMAIL ONLY (not in NOTIFICATION_REGISTRY) per spec.
+    await _send_membership_change_email(user_id, prior_tier, tier)
+
+    # Scenario 21 (membership_cancelled): the member scheduled a
+    # cancellation — access continues until the period ends, which is
+    # exactly what the template/push copy says. Sent on the false → true
+    # transition only; premium_ended follows when Stripe deletes the
+    # subscription at period end.
+    if cancel_at_period_end and not prior.get("cancel_at_period_end") and tier != "basic":
+        from transactional_email import send_transactional_email as _send_email
+        try:
+            await _send_email(
+                user_id=user_id,
+                template_slug="membership_cancelled",
+                extra_vars={"prior_tier": tier},
+                dedup_window_hours=24,
+            )
+        except Exception as e:
+            logger.warning("[billing] cancellation email failed for %s: %r", user_id, e)
+
+
+async def _send_membership_change_email(user_id: str, prior_tier: str, tier: str) -> None:
+    """
+    Scenarios 15-18 of the 2026-10-12 spec. Fire-and-forget; EMAIL ONLY
+    (welcome_* / membership_upgraded aren't in NOTIFICATION_REGISTRY).
+      basic → paid        : welcome_<tier>   (first event to land wins; the
+                            second sees the paid tier and sends nothing)
+      paid A → paid B     : membership_upgraded
+      same tier (renewal) : nothing
+    """
     from transactional_email import send_transactional_email as _send_email
     if prior_tier == "basic" and tier != "basic":
-        # First-time subscriber → welcome email for the specific tier
         welcome_slug = {
             "premium": "welcome_premium",
             "premium-lite": "welcome_premium_lite",
@@ -474,7 +633,6 @@ async def _handle_subscription_active(sub: dict) -> None:
             except Exception as e:
                 logger.warning("[billing] welcome email failed for %s: %r", user_id, e)
     elif prior_tier != "basic" and prior_tier != tier and tier != "basic":
-        # Existing subscriber swapped plans → "upgraded" email
         try:
             await _send_email(
                 user_id=user_id,
@@ -486,20 +644,40 @@ async def _handle_subscription_active(sub: dict) -> None:
             logger.warning("[billing] upgraded email failed for %s: %r", user_id, e)
 
 
+async def _get_current_membership(user_id: str) -> dict:
+    """Active membership snapshot {tier, stripe_subscription_id,
+    cancel_at_period_end}; tier falls back to 'basic' like _get_current_tier."""
+    try:
+        rows = await supabase.select(
+            "user_memberships",
+            columns="tier,stripe_subscription_id,cancel_at_period_end",
+            eq={"user_id": user_id, "is_active": True},
+            limit=1,
+        )
+        if rows:
+            row = dict(rows[0])
+            row["tier"] = row.get("tier") or "basic"
+            return row
+    except Exception:
+        pass
+    return {"tier": "basic", "stripe_subscription_id": None, "cancel_at_period_end": None}
+
+
 async def _get_current_tier(user_id: str) -> str:
     """Snapshot the user's currently-active membership tier so webhook
     handlers can tell "first subscription" vs "plan change". Falls back
     to 'basic' when there's no active row — same semantic the matching
     quota code uses."""
     try:
+        # NB: SupabaseRest.select takes columns/eq/limit — an earlier
+        # `params=` call raised TypeError here, which was swallowed and made
+        # every user look like "basic" (welcome email on each renewal, no
+        # upgrade/cancellation emails).
         rows = await supabase.select(
             "user_memberships",
-            params={
-                "select": "tier",
-                "user_id": f"eq.{user_id}",
-                "is_active": "eq.true",
-                "limit": "1",
-            },
+            columns="tier",
+            eq={"user_id": user_id, "is_active": True},
+            limit=1,
         )
         if rows and rows[0].get("tier"):
             return rows[0]["tier"]
@@ -508,13 +686,24 @@ async def _get_current_tier(user_id: str) -> str:
     return "basic"
 
 
-async def _handle_subscription_cancelled(sub: dict) -> None:
+async def _handle_subscription_cancelled(sub: dict, *, send_email: bool = True) -> None:
+    """The subscription has actually ENDED (customer.subscription.deleted,
+    or status canceled / incomplete_expired): drop to basic and tell the
+    member their paid access ended (X-EMAIL.6 premium_ended)."""
     user_id = _user_id_from_object(sub)
     if not user_id:
         return
-    # Capture prior tier BEFORE we flip them to basic — so the email
+    # Capture prior state BEFORE we flip them to basic — so the email
     # copy can reference what they had.
-    prior_tier = await _get_current_tier(user_id)
+    prior = await _get_current_membership(user_id)
+    prior_tier = prior["tier"]
+    ended_sub = sub.get("id")
+    current_sub = prior.get("stripe_subscription_id")
+    if ended_sub and current_sub and current_sub != ended_sub:
+        # A late "deleted" for an OLD subscription must not downgrade a
+        # member who has since started a new one (H13.17).
+        logger.info("[billing] ended subscription is not the member's current one; no downgrade")
+        return
 
     # Drop them back to the free tier.
     await _upsert_active_membership(
@@ -529,24 +718,37 @@ async def _handle_subscription_cancelled(sub: dict) -> None:
         last_invoice_status="canceled",
     )
 
-    # Scenarios 21 (membership_cancelled) + 22 (premium_ended) of the
-    # 2026-10-12 spec: email + push. Both templates are in the
-    # NOTIFICATION_REGISTRY so push auto-fires alongside email. We fire
-    # cancellation now (confirms the action); the expiration email is
-    # fired separately by the sweep that detects current_period_end
-    # elapsed — not here, since Stripe may give the user grace until
-    # the period actually ends.
-    from transactional_email import send_transactional_email as _send_email
-    if prior_tier != "basic":
+    if send_email and prior_tier != "basic":
+        await _send_premium_ended_once(user_id, ended_sub, prior_tier)
+
+
+async def _send_premium_ended_once(user_id: str, sub_id: Optional[str], prior_tier: str) -> bool:
+    """
+    Scenario 22 (premium_ended): email + push (registry) exactly once per
+    ended subscription. The claim is a synthetic stripe_events row keyed
+    `premium_ended:<sub_id>` (primary key → unique), so webhook
+    redeliveries, a canceled-status update followed by the deleted event,
+    and the reconciliation job can't send it twice. Without a sub id the
+    24h template dedup is the only guard.
+    """
+    if sub_id:
         try:
-            await _send_email(
-                user_id=user_id,
-                template_slug="membership_cancelled",
-                extra_vars={"prior_tier": prior_tier},
-                dedup_window_hours=24,
-            )
+            if not await _record_event_or_skip(f"premium_ended:{sub_id}", "internal.premium_ended_email"):
+                return False
         except Exception as e:
-            logger.warning("[billing] cancellation email failed for %s: %r", user_id, e)
+            logger.warning("[billing] premium_ended claim failed (%r); relying on template dedup", e)
+    from transactional_email import send_transactional_email as _send_email
+    try:
+        await _send_email(
+            user_id=user_id,
+            template_slug="premium_ended",
+            extra_vars={"prior_tier": prior_tier},
+            dedup_window_hours=24,
+        )
+        return True
+    except Exception as e:
+        logger.warning("[billing] premium_ended email failed for %s: %r", user_id, e)
+        return False
 
 
 async def _handle_invoice(inv: dict, *, status: str) -> None:
@@ -564,12 +766,9 @@ async def _handle_invoice(inv: dict, *, status: str) -> None:
         # Look up the user_id for this subscription so we can email them.
         rows = await supabase.select(
             "user_memberships",
-            params={
-                "select": "user_id",
-                "stripe_subscription_id": f"eq.{sub_id}",
-                "is_active": "eq.true",
-                "limit": "1",
-            },
+            columns="user_id",
+            eq={"stripe_subscription_id": sub_id, "is_active": True},
+            limit=1,
         )
         user_id = rows[0]["user_id"] if rows else None
         if user_id:
@@ -601,6 +800,108 @@ async def _handle_invoice(inv: dict, *, status: str) -> None:
         )
     except Exception as e:
         logger.warning("Could not record invoice %s status: %s", inv.get("id"), e)
+
+
+# -----------------------------------------------------------------------------
+# H13.17 · Daily subscription reconciliation (ENABLE_STRIPE_RECONCILE)
+# -----------------------------------------------------------------------------
+def reconcile_enabled() -> bool:
+    return (os.getenv("ENABLE_STRIPE_RECONCILE") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _iso_to_epoch(v) -> Optional[int]:
+    if not v:
+        return None
+    try:
+        return int(datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
+async def reconcile_subscriptions() -> dict:
+    """
+    Compare every active membership that carries a stripe_subscription_id
+    with the subscription's live state in Stripe and correct tier / expiry
+    drift (missed or out-of-order webhooks). Idempotent: a row that already
+    matches is left alone, and an ended subscription goes through the same
+    path as the deleted webhook (premium_ended claimed once per sub).
+    Logs counts only — no member ids or emails.
+    """
+    import asyncio
+
+    counts = {"checked": 0, "ok": 0, "corrected": 0, "ended": 0, "skipped": 0, "errors": 0}
+    try:
+        rows = await supabase.select(
+            "user_memberships",
+            columns="user_id,tier,stripe_subscription_id,stripe_customer_id,current_period_end,cancel_at_period_end",
+            eq={"is_active": True},
+        )
+    except Exception as e:
+        logger.error("[billing-reconcile] membership listing failed: %r", e)
+        counts["errors"] += 1
+        return counts
+
+    rows = [r for r in rows or [] if r.get("stripe_subscription_id")]
+    if not rows:
+        logger.info("[billing-reconcile] done %s", counts)
+        return counts
+    await refresh_price_to_tier_from_db()
+    stripe = _get_stripe()
+
+    for row in rows:
+        counts["checked"] += 1
+        sub_id = row["stripe_subscription_id"]
+        try:
+            sub = _plain(await asyncio.to_thread(stripe.Subscription.retrieve, sub_id))
+            status = sub.get("status")
+            md = dict(sub.get("metadata") or {})
+            md["cheripic_user_id"] = row["user_id"]  # the row being reconciled
+            sub["metadata"] = md
+            if status in ("canceled", "incomplete_expired"):
+                await _handle_subscription_cancelled(sub)
+                counts["ended"] += 1
+                continue
+            items = (sub.get("items") or {}).get("data") or []
+            price_id = items[0]["price"]["id"] if items else None
+            tier = _tier_for_price(price_id)
+            if not tier:
+                counts["skipped"] += 1
+                continue
+            cps_dt, cpe_dt = _period_bounds(sub)
+            want_end = int(cpe_dt.timestamp()) if cpe_dt else None
+            have_end = _iso_to_epoch(row.get("current_period_end"))
+            cape = bool(sub.get("cancel_at_period_end"))
+            if tier == row.get("tier") and want_end == have_end and cape == bool(row.get("cancel_at_period_end")):
+                counts["ok"] += 1
+                continue
+            await _upsert_active_membership(
+                user_id=row["user_id"],
+                tier=tier,
+                stripe_customer_id=sub.get("customer") or row.get("stripe_customer_id"),
+                stripe_subscription_id=sub_id,
+                stripe_price_id=price_id,
+                current_period_start=cps_dt,
+                current_period_end=cpe_dt,
+                cancel_at_period_end=cape,
+                last_invoice_status=status,
+            )
+            counts["corrected"] += 1
+        except Exception as e:
+            if "No such subscription" in str(e) or getattr(e, "code", None) == "resource_missing":
+                # Gone in Stripe → treat as ended.
+                try:
+                    await _handle_subscription_cancelled(
+                        {"id": sub_id, "customer": row.get("stripe_customer_id"),
+                         "metadata": {"cheripic_user_id": row["user_id"]}}
+                    )
+                    counts["ended"] += 1
+                    continue
+                except Exception:
+                    pass
+            counts["errors"] += 1
+            logger.warning("[billing-reconcile] one subscription failed: %s", type(e).__name__)
+    logger.info("[billing-reconcile] done %s", counts)
+    return counts
 
 
 # -----------------------------------------------------------------------------
@@ -709,6 +1010,62 @@ async def increment_period_usage(user_id: str, period_start: str) -> int:
     except Exception as e:
         logger.warning("period usage upsert failed for %s: %s", user_id, e)
     return new_count
+
+
+async def try_reserve_message(user_id: str, period_start: str, limit: Optional[int]):
+    """
+    Atomically count one CheriAI message against the period BEFORE the LLM
+    call (RPC public.reserve_cheri_message, migration 050 — NOT APPLIED).
+
+    Returns the new count (int) when reserved, False when the cap is already
+    reached, or None when the RPC isn't deployed / errored — the caller then
+    uses the legacy check-then-increment path.
+    """
+    import httpx
+    from supabase_client import SUPABASE_URL, SUPABASE_KEY
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/reserve_cheri_message",
+                json={"p_user_id": user_id, "p_period_start": period_start, "p_limit": limit},
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                         "Content-Type": "application/json"},
+            )
+    except Exception as e:
+        logger.warning("reserve_cheri_message unreachable for %s: %r", user_id, e)
+        return None
+    if r.status_code >= 300:
+        if r.status_code != 404:
+            logger.warning("reserve_cheri_message failed [%s]: %s", r.status_code, r.text[:200])
+        return None
+    try:
+        val = r.json()
+    except ValueError:
+        return None
+    if val is None:
+        return False
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+async def release_message(user_id: str, period_start: str) -> None:
+    """Give back a reservation when the LLM call failed (best-effort)."""
+    import httpx
+    from supabase_client import SUPABASE_URL, SUPABASE_KEY
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/release_cheri_message",
+                json={"p_user_id": user_id, "p_period_start": period_start},
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                         "Content-Type": "application/json"},
+            )
+    except Exception as e:
+        logger.warning("release_cheri_message failed for %s: %r", user_id, e)
 
 
 async def get_membership_tier(user_id: str) -> str:

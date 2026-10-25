@@ -36,8 +36,10 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import time
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
@@ -49,6 +51,7 @@ from cron_daily_email import (
     _cfg_support_email,
     _cfg_unsubscribe_url,
     _load_template,
+    mask_email,
     send_email,
 )
 
@@ -143,6 +146,13 @@ async def _build_auth_render_context(
 
     app_base = await _cfg_app_base_url()
     redirect = email_data.get("redirect_to") or app_base
+    # The verify endpoint lives on Supabase Auth, not on the app domain.
+    auth_base = (os.getenv("SUPABASE_URL") or app_base).rstrip("/")
+    verify_qs = urlencode({
+        "token": email_data.get("token_hash", ""),
+        "type": email_data.get("email_action_type", "magiclink"),
+        "redirect_to": redirect,
+    })
 
     ctx = {
         "name": display_name,
@@ -150,12 +160,7 @@ async def _build_auth_render_context(
         # OTP; `token_hash` is the version used in confirmation URLs.
         "otp_code": str(email_data.get("token") or ""),
         "token_hash": str(email_data.get("token_hash") or ""),
-        "confirmation_url": (
-            f"{app_base}/auth/v1/verify"
-            f"?token={email_data.get('token_hash', '')}"
-            f"&type={email_data.get('email_action_type', 'magiclink')}"
-            f"&redirect_to={redirect}"
-        ),
+        "confirmation_url": f"{auth_base}/auth/v1/verify?{verify_qs}",
         "app_url": app_base,
         "redirect_url": redirect,
         "logo_url": await _cfg_logo_url(),
@@ -205,7 +210,7 @@ async def handle_send_email(payload: dict[str, Any]) -> dict[str, Any]:
 
     logger.info(
         "[auth-hook] delivered action=%s to=%s slug=%s resend_id=%s",
-        action, recipient, slug, provider_id,
+        action, mask_email(recipient), slug, provider_id,
     )
     return {
         "ok": True,

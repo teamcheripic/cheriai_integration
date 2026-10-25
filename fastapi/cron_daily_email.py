@@ -243,11 +243,15 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
             client,
             "user_profiles",
             {
-                "select": "user_id,email,nick_name,full_name",
+                "select": "user_id,email,nick_name,full_name,notify_email_enabled",
                 "user_id": f"in.({','.join(chunk)})",
             },
         )
         for r in prof_rows:
+            # Member opted out of email (migration 043) — the daily nudge is
+            # marketing-style, so it must honour the preference too.
+            if r.get("notify_email_enabled") is False:
+                continue
             if r.get("email"):
                 email_by_user[r["user_id"]] = r
 
@@ -274,6 +278,10 @@ async def gather_candidates(client: httpx.AsyncClient) -> list[dict[str, Any]]:
         # can still show it in the template if desired, but the synthetic
         # notification list only carries match_available entries.
         match_avail_count = max(unacted, waiting) if unacted > 0 else 0
+        if match_avail_count <= 0:
+            # Nothing unread to nudge about (pending interests have their own
+            # event email) — don't send an empty "a connection is waiting".
+            continue
         synthetic_notifs: list[dict[str, Any]] = (
             [{"type": "match_available", "id": "", "title": "", "body": ""}] * match_avail_count
         )
@@ -329,6 +337,14 @@ async def _load_template(slug: str) -> dict[str, str] | None:
     except Exception as e:
         logger.warning("email_templates load failed for slug=%s: %r", slug, e)
         return None
+
+
+def mask_email(addr: str | None) -> str:
+    """'jane.doe@example.com' -> 'j***@example.com' for logs (no raw PII)."""
+    if not addr or "@" not in addr:
+        return "***"
+    local, _, domain = addr.partition("@")
+    return f"{local[:1]}***@{domain}"
 
 
 def _apply_template_vars(text: str, ctx: dict[str, Any]) -> str:
@@ -450,9 +466,12 @@ async def render_email(name: str, notifs: list[dict[str, Any]]) -> tuple[str, st
 
 
 async def send_email(
-    client: httpx.AsyncClient, to: str, subject: str, html: str, text: str
+    client: httpx.AsyncClient, to: str, subject: str, html: str, text: str,
+    headers: dict[str, str] | None = None,
 ) -> tuple[bool, str | None]:
-    """Fire one Resend send. Returns (ok, provider_message_id_or_None)."""
+    """Fire one Resend send. Returns (ok, provider_message_id_or_None).
+    `headers` are extra MIME headers (only the marketing nudge passes
+    List-Unsubscribe; transactional mail never does)."""
     api_key = await _cfg_resend_api_key()
     from_address = await _cfg_from_address()
     if not api_key:
@@ -471,11 +490,12 @@ async def send_email(
             "subject": subject,
             "html": html,
             "text": text,
+            **({"headers": headers} if headers else {}),
         },
         timeout=15.0,
     )
     if res.status_code >= 300:
-        logger.warning("Resend %s for %s: %s", res.status_code, to, res.text[:200])
+        logger.warning("Resend %s for %s: %s", res.status_code, mask_email(to), res.text[:200])
         return False, None
     try:
         return True, (res.json() or {}).get("id")
@@ -571,6 +591,108 @@ async def send_template_test_email(
     }
 
 
+# --- One-click unsubscribe (X-EMAIL.7, RFC 8058) ---------------------------
+# The daily nudge is the only marketing-style mail, so it alone carries
+# List-Unsubscribe + List-Unsubscribe-Post. The link holds an HMAC-signed
+# token (no expiry — unsubscribe links must keep working) that POST
+# /emails/unsubscribe verifies before turning the member's email
+# preference (user_profiles.notify_email_enabled, migration 043) off.
+_UNSUB_PURPOSE = b"cheripic:unsubscribe:daily_match_nudge:v1"
+DEFAULT_PUBLIC_API_BASE_URL = "https://cheriaiintegration-production.up.railway.app"
+
+
+def _unsubscribe_secret() -> bytes | None:
+    import hashlib
+    import hmac
+
+    explicit = os.getenv("EMAIL_UNSUBSCRIBE_SECRET")
+    if explicit:
+        return explicit.encode()
+    if SUPABASE_KEY:
+        # Derived, never the raw service key, and never logged.
+        return hmac.new(SUPABASE_KEY.encode(), b"cheripic-email-unsubscribe-v1", hashlib.sha256).digest()
+    return None
+
+
+def _b64(raw: bytes) -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _unb64(txt: str) -> bytes:
+    import base64
+
+    return base64.urlsafe_b64decode(txt + "=" * (-len(txt) % 4))
+
+
+def make_unsubscribe_token(user_id: str) -> str | None:
+    import hashlib
+    import hmac
+
+    secret = _unsubscribe_secret()
+    if not secret or not user_id:
+        return None
+    sig = hmac.new(secret, _UNSUB_PURPOSE + b"|" + user_id.encode(), hashlib.sha256).digest()
+    return f"{_b64(user_id.encode())}.{_b64(sig)}"
+
+
+def verify_unsubscribe_token(token: str | None) -> str | None:
+    """Return the user id for a genuine token, else None (constant-time compare)."""
+    import hashlib
+    import hmac
+    import uuid
+
+    secret = _unsubscribe_secret()
+    if not secret or not token or token.count(".") != 1 or len(token) > 512:
+        return None
+    uid_part, sig_part = token.split(".")
+    try:
+        user_id = _unb64(uid_part).decode()
+        sig = _unb64(sig_part)
+        uuid.UUID(user_id)
+    except Exception:
+        return None
+    want = hmac.new(secret, _UNSUB_PURPOSE + b"|" + user_id.encode(), hashlib.sha256).digest()
+    return user_id if hmac.compare_digest(sig, want) else None
+
+
+def unsubscribe_url(user_id: str) -> str | None:
+    from urllib.parse import quote
+
+    token = make_unsubscribe_token(user_id)
+    if not token:
+        return None
+    base = (os.getenv("PUBLIC_API_BASE_URL") or DEFAULT_PUBLIC_API_BASE_URL).rstrip("/")
+    return f"{base}/emails/unsubscribe?token={quote(token)}"
+
+
+def list_unsubscribe_headers(user_id: str) -> dict[str, str] | None:
+    url = unsubscribe_url(user_id)
+    if not url:
+        return None
+    return {
+        "List-Unsubscribe": f"<{url}>",
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
+    }
+
+
+async def apply_unsubscribe(user_id: str) -> bool:
+    """Turn the member's email preference off (idempotent). True on success."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.patch(
+            f"{_PG_BASE}/user_profiles",
+            params={"user_id": f"eq.{user_id}"},
+            json={"notify_email_enabled": False},
+            headers={**_PG_HEADERS, "Prefer": "return=minimal"},
+            timeout=15.0,
+        )
+    if resp.status_code >= 300:
+        logger.warning("[unsubscribe] preference write failed [%s]", resp.status_code)
+        return False
+    return True
+
+
 # --- Orchestration --------------------------------------------------------
 async def run_once(dry_run: bool = False) -> dict[str, int]:
     """One full cron pass. Returns counts so the caller/scheduler can log."""
@@ -595,31 +717,34 @@ async def run_once(dry_run: bool = False) -> dict[str, int]:
         for c in candidates:
             subject, html, text = await render_email(c["nick_name"], c["notifications"])
             if dry_run:
-                logger.info("[dry-run] %-30s | %d notif → %s", c["email"], len(c["notifications"]), subject)
+                logger.info("[dry-run] %-30s | %d notif → %s", mask_email(c["email"]), len(c["notifications"]), subject)
                 sent += 1
                 continue
 
-            ok, provider_id = await send_email(client, c["email"], subject, html, text)
+            ok, provider_id = await send_email(
+                client, c["email"], subject, html, text,
+                headers=list_unsubscribe_headers(c["user_id"]),
+            )
             if not ok:
                 failed += 1
                 continue
 
             sent += 1
-            # Record ONE sent_emails row per notification covered. This is
-            # what future runs check to skip already-covered notifications,
-            # so the row count must match the notification count — not "1
-            # per email".
-            for n in c["notifications"]:
-                await _pg_post(client, "sent_emails", {
-                    "user_id": c["user_id"],
-                    "email": c["email"],
-                    "notification_id": n["id"],
-                    "campaign": CAMPAIGN,
-                    "subject": subject,
-                    "provider": "resend",
-                    "provider_id": provider_id,
-                    "status": "sent",
-                })
+            # Record ONE sent_emails row per email. gather_candidates()
+            # dedups on (user_id, campaign, sent_at), so that's all it needs.
+            # The previous per-notification rows carried notification_id=""
+            # (synthetic notifications have no id) which a uuid column
+            # rejects — no audit row landed and the dedup never engaged.
+            await _pg_post(client, "sent_emails", {
+                "user_id": c["user_id"],
+                "email": c["email"],
+                "notification_id": None,
+                "campaign": CAMPAIGN,
+                "subject": subject,
+                "provider": "resend",
+                "provider_id": provider_id,
+                "status": "sent",
+            })
 
         result = {"sent": sent, "failed": failed, "skipped": 0, "eligible": len(candidates)}
         logger.info("Cron done: %s", result)

@@ -15,6 +15,7 @@ Run:
 """
 
 import os
+import json
 import logging
 import math
 from datetime import datetime, timezone, timedelta
@@ -32,7 +33,8 @@ load_dotenv()
 
 from auth import get_current_user_id, get_current_admin_id, require_self
 from supabase_client import supabase, SUPABASE_URL, SUPABASE_KEY
-from llm_client import send_to_llm
+import llm_client
+from llm_client import send_to_llm, send_to_llm_with_usage, build_usage_ledger_row
 from cheriai_prompts import CheriAIPromptBuilder
 from user_memory import (
     load_memory,
@@ -60,6 +62,16 @@ from auth_email_hook import (
 )
 from canned_responses import classify as classify_canned, respond as respond_canned
 from partnership import finalize_partnership, PartnershipError
+from member_actions import (
+    withdraw_interest,
+    delete_account,
+    pause_partner_after_official_end,
+    latest_match_between,
+    request_in_state,
+    recent_notification_exists,
+    MemberActionError,
+)
+from face_verification import is_own_storage_image_url
 from transactional_email import send_transactional_email
 
 logging.basicConfig(
@@ -74,6 +86,64 @@ FRONTEND_URLS = os.getenv(
     "FRONTEND_URLS",
     "http://localhost:5173,http://localhost:5174,http://localhost:5175,http://localhost:5176,http://127.0.0.1:5173"
 ).split(",")
+
+
+MAX_CHAT_MESSAGE_CHARS = 2000
+ALLOWED_CHAT_STAGES = frozenset({"general", "onboarding", "golden_questions", "matching"})
+
+
+def _assert_production_config() -> None:
+    """Fail fast in production rather than serving "[MOCK LLM] …" replies."""
+    env = (os.getenv("ENVIRONMENT") or "").strip().lower()
+    if env in ("production", "prod") and not llm_client.OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is required when ENVIRONMENT=production")
+
+
+def _safe_return_url(url: Optional[str], default_path: str = "/#/profile") -> str:
+    """
+    Billing redirect targets (Stripe portal return_url, checkout success/
+    cancel) must stay on CheriPic: the app web origin, a configured
+    FRONTEND_URLS origin, or the app's own cheripic:// scheme. Anything else
+    is replaced by the default — no open redirect via our Stripe session.
+    """
+    from urllib.parse import urlsplit
+
+    base = (os.getenv("APP_BASE_URL") or "https://cheripic.com").rstrip("/")
+    allowed = {urlsplit(base).netloc} | {urlsplit(u.strip()).netloc for u in FRONTEND_URLS if u.strip()}
+    try:
+        parts = urlsplit(url or "")
+    except ValueError:
+        parts = None
+    if parts and parts.scheme == "cheripic":
+        return url  # type: ignore[return-value]
+    if parts and parts.scheme in ("https", "http") and parts.netloc in allowed and not parts.username:
+        return url  # type: ignore[return-value]
+    return base + default_path
+
+
+async def _record_ai_usage(row: dict) -> None:
+    """
+    Persist one privacy-minimised usage-ledger row (no prompt/reply text).
+    Needs public.ai_usage_ledger (migration 050, NOT APPLIED); until it
+    exists the row is logged instead so spend can still be measured.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/ai_usage_ledger",
+                json=row,
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+            )
+        if r.status_code < 300:
+            return
+        logger.info("[ai-usage] ledger table unavailable [%s]; row=%s", r.status_code, json.dumps(row))
+    except Exception as e:
+        logger.info("[ai-usage] ledger insert failed (%r); row=%s", e, json.dumps(row))
 
 
 class ChatRequest(BaseModel):
@@ -91,7 +161,15 @@ class ChatRequest(BaseModel):
     def message_not_empty(cls, v):
         if not v or len(v.strip()) == 0:
             raise ValueError("message cannot be empty")
+        if len(v) > MAX_CHAT_MESSAGE_CHARS:
+            raise ValueError(f"message must be at most {MAX_CHAT_MESSAGE_CHARS} characters")
         return v
+
+    @validator('stage', always=True)
+    def stage_allowed(cls, v):
+        # Unknown stages fall back to "general" (the prompt builder's
+        # default) instead of flowing into prompts/logs/chat_history.
+        return v if v in ALLOWED_CHAT_STAGES else "general"
 
 
 class ConversationMessage(BaseModel):
@@ -152,6 +230,8 @@ def _split_reply_and_followup(raw: str) -> tuple[str, Optional[str]]:
                 if not follow or follow == main or len(follow) > 250:
                     return main, None
                 return main, follow
+            # Valid JSON object but no reply text: never show raw JSON.
+            return "", None
     except (ValueError, TypeError):
         pass  # not JSON — fall through
 
@@ -195,9 +275,30 @@ async def fetch_user_profile(user_id: str) -> Optional[dict]:
         return None
 
 
+def _schedule_stripe_reconcile(scheduler) -> bool:
+    """H13.17 · daily Stripe ↔ user_memberships reconciliation, opt-in via
+    ENABLE_STRIPE_RECONCILE (crontab override STRIPE_RECONCILE_CRON, UTC)."""
+    if not billing.reconcile_enabled():
+        return False
+    from apscheduler.triggers.cron import CronTrigger
+
+    scheduler.add_job(
+        billing.reconcile_subscriptions,
+        CronTrigger.from_crontab((os.getenv("STRIPE_RECONCILE_CRON") or "15 3 * * *").strip(), timezone="UTC"),
+        id="stripe_reconcile",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+        replace_existing=True,
+    )
+    logger.info("Stripe reconciliation job armed.")
+    return True
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("CheriPic AI Backend starting...")
+    _assert_production_config()
     logger.info(f"Allowed origins: {FRONTEND_URLS}")
     # Pass the Stripe price → tier mapping to the billing module so the
     # webhook handler knows which tier to grant for each price_id.
@@ -296,6 +397,7 @@ async def lifespan(app: FastAPI):
             max_instances=1,
             coalesce=True,
         )
+        _schedule_stripe_reconcile(scheduler)
         scheduler.start()
         app.state.scheduler = scheduler
         logger.info("Cron supervisor running (15-min reconcile against app_config).")
@@ -323,6 +425,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# --- Rate limiting (X-SEC.3) ------------------------------------------------
+# slowapi, in-process memory storage (per worker). Bucket = the VERIFIED
+# member id when the request's bearer token was verified by
+# get_current_user_id (auth cache), otherwise the client IP. An unverified
+# JWT `sub` is never used, so nobody can drain another member's bucket.
+# Limits are env-tunable at boot: RATE_LIMIT_<NAME>="20/minute".
+# RATE_LIMIT_TRUST_PROXY=true uses the first X-Forwarded-For hop (Railway).
+from slowapi.errors import RateLimitExceeded
+from fastapi.responses import JSONResponse
+# Limiter, key function and limits live in ratelimit.py so feature routers
+# (media, cheripass, official, readiness) share the same buckets.
+from ratelimit import limiter, rate_limit_key, RATE_LIMITS, _client_ip, _rl  # noqa: F401
+
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def _rate_limit_exceeded(request: Request, exc: RateLimitExceeded):
+    # Generic body: no limit strings or bucket keys echoed back.
+    logger.warning("rate limit hit on %s", request.url.path)
+    return JSONResponse(status_code=429, content={"detail": "too_many_requests"}, headers={"Retry-After": "60"})
+
+
+# --- Feature routers (added by integration) ---
+for _mod in ("media", "cheripass", "official", "readiness"):
+    try:
+        app.include_router(__import__(_mod).router)
+    except ModuleNotFoundError:
+        pass
 
 
 @app.get("/", tags=["Health"])
@@ -437,14 +570,32 @@ class FinalizePartnershipRequest(BaseModel):
         return v
 
 
+class WithdrawInterestRequest(BaseModel):
+    request_id: str
+
+    @validator("request_id")
+    def _valid_uuid(cls, v: str) -> str:
+        if not v or len(v) < 8:
+            raise ValueError("request_id is required")
+        return v
+
+
 class SelfTriggerEmailRequest(BaseModel):
     template_slug: str
-    extra_vars: Optional[dict] = None
+    extra_vars: Optional[dict] = None  # ignored — see trigger_self_email
     dedup_window_hours: int = 1
 
 
+# Templates a member may send to THEMSELVES. Everything else (verification
+# outcomes, billing, relationship events) is triggered server-side only, so
+# a client can't forge e.g. a "You're verified ✓" email + push.
+SELF_TRIGGERABLE_TEMPLATES = frozenset({"welcome_free", "verification_submitted"})
+
+
 @app.post("/emails/trigger-self", tags=["Email"])
+@limiter.limit(RATE_LIMITS["trigger_self_email"])
 async def trigger_self_email(
+    request: Request,
     req: SelfTriggerEmailRequest,
     caller_user_id: str = Depends(get_current_user_id),
 ):
@@ -461,13 +612,135 @@ async def trigger_self_email(
         "[trigger-self-email] user=%s template=%s",
         caller_user_id, req.template_slug,
     )
+    if req.template_slug not in SELF_TRIGGERABLE_TEMPLATES:
+        raise HTTPException(status_code=400, detail="template_not_self_triggerable")
     ok = await send_transactional_email(
         user_id=caller_user_id,
         template_slug=req.template_slug,
-        extra_vars=req.extra_vars,
-        dedup_window_hours=req.dedup_window_hours,
+        extra_vars=None,
+        dedup_window_hours=max(1, req.dedup_window_hours),
     )
     return {"ok": ok, "template": req.template_slug}
+
+
+_UNSUB_CONFIRM_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>CheriPic emails</title></head>
+<body style="font-family:Helvetica,Arial,sans-serif;max-width:480px;margin:48px auto;padding:0 16px;color:#222">
+{body}</body></html>"""
+
+
+@app.get("/emails/unsubscribe", tags=["Email"])
+@limiter.limit(RATE_LIMITS["unsubscribe"])
+async def email_unsubscribe_page(request: Request, token: str = ""):
+    """
+    X-EMAIL.7 · Landing page for the List-Unsubscribe link. GET never
+    changes anything (mail scanners prefetch links); it shows a one-button
+    form that POSTs back. Mail clients' one-click uses POST directly.
+    """
+    from fastapi.responses import HTMLResponse
+    from html import escape
+    from cron_daily_email import verify_unsubscribe_token
+
+    if not verify_unsubscribe_token(token):
+        return HTMLResponse(_UNSUB_CONFIRM_PAGE.format(body="<p>This unsubscribe link is not valid.</p>"), status_code=400)
+    form = (
+        "<p>Stop CheriPic reminder emails?</p>"
+        f'<form method="post" action="/emails/unsubscribe?token={escape(token, quote=True)}">'
+        '<input type="hidden" name="List-Unsubscribe" value="One-Click">'
+        '<button type="submit">Unsubscribe</button></form>'
+        "<p style=\"font-size:13px;color:#666\">You can turn emails back on in the app under Profile → Communication preferences.</p>"
+    )
+    return HTMLResponse(_UNSUB_CONFIRM_PAGE.format(body=form))
+
+
+@app.post("/emails/unsubscribe", tags=["Email"])
+@limiter.limit(RATE_LIMITS["unsubscribe"])
+async def email_unsubscribe(request: Request, token: str = ""):
+    """
+    X-EMAIL.7 · RFC 8058 one-click unsubscribe. The HMAC-signed token
+    identifies the member (no login); success turns their email preference
+    (user_profiles.notify_email_enabled) off. Idempotent.
+    """
+    from cron_daily_email import verify_unsubscribe_token, apply_unsubscribe
+
+    user_id = verify_unsubscribe_token(token)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="invalid_token")
+    if not await apply_unsubscribe(user_id):
+        raise HTTPException(status_code=503, detail="try_again_later")
+    logger.info("[unsubscribe] email preference turned off via one-click link")
+    return {"ok": True, "unsubscribed": True}
+
+
+# --- H14S.14 · Report receipt -----------------------------------------------
+REPORT_RECEIPT_TITLE = "Report received"
+REPORT_RECEIPT_BODY = "Thanks for telling us. Our team will review it."
+
+
+class ReportSubmittedRequest(BaseModel):
+    report_id: str
+
+
+@app.post("/safety/report-submitted", tags=["Safety"])
+@limiter.limit(RATE_LIMITS["notify"])
+async def safety_report_submitted(
+    request: Request,
+    req: ReportSubmittedRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    Private in-app receipt for the REPORTER only (handoff §14 "Report
+    submitted"). The report must exist and belong to the caller; the
+    reported member is never notified and the receipt carries no subject
+    details. Idempotent per report (one receipt row per report id).
+    Until migration 051 adds 'report_submitted' to the notifications type
+    CHECK, the insert is refused and the endpoint answers
+    {ok: true, receipt: "deferred"}.
+    """
+    import uuid as _uuid
+
+    try:
+        _uuid.UUID(req.report_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid_report_id")
+    hdrs = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(
+            f"{SUPABASE_URL}/rest/v1/user_reports",
+            params={"select": "id", "id": f"eq.{req.report_id}", "reporter_id": f"eq.{caller_user_id}", "limit": "1"},
+            headers=hdrs,
+        )
+        if r.status_code >= 300:
+            logger.error("[report-receipt] report lookup failed [%s]", r.status_code)
+            raise HTTPException(status_code=502, detail="lookup_failed")
+        if not r.json():
+            # Same answer for "no such report" and "someone else's report".
+            raise HTTPException(status_code=404, detail="report_not_found")
+        existing = await client.get(
+            f"{SUPABASE_URL}/rest/v1/notifications",
+            params={"select": "id", "user_id": f"eq.{caller_user_id}", "type": "eq.report_submitted",
+                    "related_id": f"eq.{req.report_id}", "limit": "1"},
+            headers=hdrs,
+        )
+        if existing.status_code < 300 and existing.json():
+            return {"ok": True, "receipt": "exists"}
+        ins = await client.post(
+            f"{SUPABASE_URL}/rest/v1/notifications",
+            json={
+                "user_id": caller_user_id,
+                "type": "report_submitted",
+                "title": REPORT_RECEIPT_TITLE,
+                "body": REPORT_RECEIPT_BODY,
+                "related_id": req.report_id,
+            },
+            headers={**hdrs, "Content-Type": "application/json", "Prefer": "return=minimal"},
+        )
+    if ins.status_code >= 300:
+        # 23514 = notifications type CHECK without migration 051. Any other
+        # failure is also soft: the report itself is already saved.
+        logger.warning("[report-receipt] receipt insert deferred [%s]", ins.status_code)
+        return {"ok": True, "receipt": "deferred"}
+    return {"ok": True, "receipt": "created"}
 
 
 class AdminTriggerEmailRequest(BaseModel):
@@ -831,7 +1104,9 @@ class NotifyInterestReceivedRequest(BaseModel):
 
 
 @app.post("/matching/notify-interest-received", tags=["Matching"])
+@limiter.limit(RATE_LIMITS["notify"])
 async def matching_notify_interest_received(
+    request: Request,
     req: NotifyInterestReceivedRequest,
     caller_user_id: str = Depends(get_current_user_id),
 ):
@@ -990,7 +1265,9 @@ class NotifyPartnerProposalRequest(BaseModel):
 
 
 @app.post("/matching/notify-partner-proposal", tags=["Matching"])
+@limiter.limit(RATE_LIMITS["notify"])
 async def matching_notify_partner_proposal(
+    request: Request,
     req: NotifyPartnerProposalRequest,
     caller_user_id: str = Depends(get_current_user_id),
 ):
@@ -1012,7 +1289,7 @@ async def matching_notify_partner_proposal(
             resp = await client.get(
                 f"{SUPABASE_URL}/rest/v1/matches",
                 params={
-                    "select": "user_a_id,user_b_id,is_active,partnered_at",
+                    "select": "user_a_id,user_b_id,is_active,partnered_at,partner_accepted_by_a,partner_accepted_by_b",
                     "id": f"eq.{req.match_id}",
                     "limit": "1",
                 },
@@ -1033,6 +1310,16 @@ async def matching_notify_partner_proposal(
                 )
                 return {"ok": True, "skipped": "not_a_participant"}
             other_id = m["user_b_id"] if m["user_a_id"] == caller_user_id else m["user_a_id"]
+            caller_flag = (
+                m.get("partner_accepted_by_a") if m["user_a_id"] == caller_user_id
+                else m.get("partner_accepted_by_b")
+            )
+            if not m.get("is_active") or m.get("partnered_at") or not caller_flag:
+                logger.warning(
+                    "[partner-proposal] no live proposal from caller match=%s caller=%s",
+                    req.match_id, caller_user_id,
+                )
+                return {"ok": True, "skipped": "no_pending_proposal"}
 
             # Dedup — don't spam if the caller re-taps. Only skips when
             # the OTHER side has an UNREAD proposal from this caller;
@@ -1119,7 +1406,7 @@ async def matching_notify_partner_proposal(
         )
     except Exception as e:
         logger.error("[partner-proposal] notify failed: %r", e, exc_info=True)
-        return {"ok": False, "exception": str(e)}
+        return {"ok": False}
     return {"ok": True, "inserted": True}
 
 
@@ -1132,7 +1419,9 @@ class NotifyUnmatchRequest(BaseModel):
 
 
 @app.post("/matching/notify-unmatch", tags=["Matching"])
+@limiter.limit(RATE_LIMITS["notify"])
 async def matching_notify_unmatch(
+    request: Request,
     req: NotifyUnmatchRequest,
     caller_user_id: str = Depends(get_current_user_id),
 ):
@@ -1151,6 +1440,30 @@ async def matching_notify_unmatch(
         caller_user_id, req.other_user_id, req.was_partnered,
     )
     try:
+        # Authorisation: the pair must really have a connection that is now
+        # closed (unmatchUser deactivates it before calling us). Without
+        # this, any member could send "connection ended" notices / emails
+        # to anyone.
+        ended = await latest_match_between(caller_user_id, req.other_user_id, active=False)
+        if not ended:
+            logger.warning(
+                "[unmatch-notify] no ended match for caller=%s other=%s — skipping",
+                caller_user_id, req.other_user_id,
+            )
+            return {"ok": True, "skipped": "no_ended_match"}
+        # "Official" is confirmed server-side: unmatchUser clears partnered_at
+        # but keeps both partner_accepted_by_* flags.
+        was_official = bool(
+            req.was_partnered
+            and ended.get("partner_accepted_by_a")
+            and ended.get("partner_accepted_by_b")
+        )
+
+        # Idempotency: a retried call must not duplicate the notices/email.
+        if await recent_notification_exists(req.other_user_id, "unmatched", caller_user_id, minutes=10):
+            logger.info("[unmatch-notify] duplicate call for caller=%s other=%s — skipped", caller_user_id, req.other_user_id)
+            return {"ok": True, "skipped": "duplicate"}
+
         # Pull nick_names for personalized copy — same privacy rule
         # as unmatchUser (nick_name only, never full_name).
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -1172,23 +1485,36 @@ async def matching_notify_unmatch(
             caller_label = name_by_id.get(caller_user_id, "Someone")
             other_label = name_by_id.get(req.other_user_id, "Someone")
 
-            notifs: list[dict[str, Any]] = [
-                {
-                    "user_id": req.other_user_id,
-                    "type": "unmatched",
-                    "title": f"You and {caller_label} ended your relationship",
-                    "body": "You're now open to new opportunities when you're ready.",
-                    "related_user_id": caller_user_id,
-                },
-            ]
-            if req.was_partnered:
-                notifs.append({
-                    "user_id": caller_user_id,
-                    "type": "unmatched",
-                    "title": f"You and {other_label} ended your relationship",
-                    "body": "You're now open to new opportunities when you're ready.",
-                    "related_user_id": req.other_user_id,
-                })
+            # Neutral copy (handoff §14): never disclose a reason, and never
+            # tell the other member they're "open" — after an official end
+            # they stay paused until they choose (see below).
+            if was_official:
+                notifs: list[dict[str, Any]] = [
+                    {
+                        "user_id": req.other_user_id,
+                        "type": "unmatched",
+                        "title": "Your official connection has ended",
+                        "body": "New introductions stay paused until you choose to resume.",
+                        "related_user_id": caller_user_id,
+                    },
+                    {
+                        "user_id": caller_user_id,
+                        "type": "unmatched",
+                        "title": f"Your official connection with {other_label} has ended",
+                        "body": "Your introduction preference has been saved.",
+                        "related_user_id": req.other_user_id,
+                    },
+                ]
+            else:
+                notifs = [
+                    {
+                        "user_id": req.other_user_id,
+                        "type": "unmatched",
+                        "title": f"Your connection with {caller_label} has ended",
+                        "body": "Your other connections and introductions are unchanged.",
+                        "related_user_id": caller_user_id,
+                    },
+                ]
 
             ins = await client.post(
                 f"{SUPABASE_URL}/rest/v1/notifications",
@@ -1208,20 +1534,20 @@ async def matching_notify_unmatch(
                     "[unmatch-notify] insert failed [%s]: %s",
                     ins.status_code, ins.text[:400],
                 )
-                return {"ok": False, "insert_status": ins.status_code, "detail": ins.text[:400]}
+                return {"ok": False, "insert_status": ins.status_code}
             logger.info("[unmatch-notify] inserted %d rows", len(notifs))
 
-        # 2026-10-12 fix: a PARTNERED unmatch (the user ended a formal
-        # relationship) needs email + push to the OTHER partner, not
-        # just an in-app notification. For a non-partnered unmatch
-        # we stay in-app only — generic connection ends are quiet by
-        # design. Only email/push the OTHER user, not the initiator
-        # (they chose the action, no reason to notify them of their
-        # own choice via another channel). Fire-and-forget — the
-        # unmatch itself already succeeded; a template miss or dedup
-        # must not fail the endpoint. Push auto-fires via
-        # NOTIFICATION_REGISTRY after email.
-        if req.was_partnered:
+        # An OFFICIAL end also emails/pushes the other member (neutral
+        # copy, generic lock-screen preview) and defaults them to paused
+        # until they make their own choice (handoff §9 / §16). An ordinary
+        # end stays in-app only. The initiator isn't emailed about their
+        # own action. Fire-and-forget — the unmatch already succeeded.
+        if was_official:
+            try:
+                paused = await pause_partner_after_official_end(caller_user_id, req.other_user_id)
+                logger.info("[unmatch-notify] other member defaulted to paused=%s", paused)
+            except Exception as e:
+                logger.warning("[unmatch-notify] pause-after-official-end failed: %r", e)
             try:
                 await send_transactional_email(
                     user_id=req.other_user_id,
@@ -1236,7 +1562,7 @@ async def matching_notify_unmatch(
                 )
     except Exception as e:
         logger.error("[unmatch-notify] failed: %r", e, exc_info=True)
-        return {"ok": False, "exception": str(e)}
+        return {"ok": False}
     return {"ok": True}
 
 
@@ -1253,7 +1579,9 @@ class NotifyInterestRespondedRequest(BaseModel):
 
 
 @app.post("/matching/notify-interest-responded", tags=["Matching"])
+@limiter.limit(RATE_LIMITS["notify"])
 async def matching_notify_interest_responded(
+    request: Request,
     req: NotifyInterestRespondedRequest,
     caller_user_id: str = Depends(get_current_user_id),
 ):
@@ -1276,6 +1604,26 @@ async def matching_notify_interest_responded(
         caller_user_id, req.sender_user_id, action,
     )
     accepted = action == "accept"
+    # Authorisation: the caller must be the receiver of an interest from
+    # sender_user_id that is now in the matching state (or, for accept, the
+    # pair now has an active connection). Otherwise this would be a relay for
+    # fake "accepted/declined" notices to arbitrary members.
+    try:
+        if accepted:
+            verified = await request_in_state(req.sender_user_id, caller_user_id, "accepted") or bool(
+                await latest_match_between(caller_user_id, req.sender_user_id, active=True)
+            )
+        else:
+            verified = await request_in_state(req.sender_user_id, caller_user_id, "declined")
+    except Exception as e:
+        logger.warning("[interest-responded] verification lookup failed: %r", e)
+        verified = False
+    if not verified:
+        logger.warning(
+            "[interest-responded] no %s request sender=%s receiver=%s — skipping",
+            action, req.sender_user_id, caller_user_id,
+        )
+        return {"ok": True, "skipped": "no_matching_request"}
     notif_type = "interest_accepted" if accepted else "match_declined"
     template_slug = "interest_accepted" if accepted else "interest_declined"
     title = (
@@ -1341,7 +1689,9 @@ class NotifyProposalDeclinedRequest(BaseModel):
 
 
 @app.post("/matching/notify-partner-proposal-declined", tags=["Matching"])
+@limiter.limit(RATE_LIMITS["notify"])
 async def matching_notify_partner_proposal_declined(
+    request: Request,
     req: NotifyProposalDeclinedRequest,
     caller_user_id: str = Depends(get_current_user_id),
 ):
@@ -1361,6 +1711,17 @@ async def matching_notify_partner_proposal_declined(
         caller_user_id, req.proposer_user_id,
     )
     try:
+        m = await latest_match_between(caller_user_id, req.proposer_user_id)
+        proposer_flag = bool(m) and (
+            m.get("partner_accepted_by_a") if m.get("user_a_id") == req.proposer_user_id
+            else m.get("partner_accepted_by_b")
+        )
+        if not m or not proposer_flag or m.get("partnered_at"):
+            logger.warning(
+                "[proposal-declined] no proposal from proposer=%s to caller=%s — skipping",
+                req.proposer_user_id, caller_user_id,
+            )
+            return {"ok": True, "skipped": "no_proposal"}
         async with httpx.AsyncClient(timeout=15.0) as client:
             prof = await client.get(
                 f"{SUPABASE_URL}/rest/v1/public_profiles",
@@ -1396,7 +1757,9 @@ class NotifyUnreadMessageRequest(BaseModel):
 
 
 @app.post("/chat/notify-unread-message", tags=["Chat"])
+@limiter.limit(RATE_LIMITS["notify"])
 async def chat_notify_unread_message(
+    request: Request,
     req: NotifyUnreadMessageRequest,
     caller_user_id: str = Depends(get_current_user_id),
 ):
@@ -1417,15 +1780,15 @@ async def chat_notify_unread_message(
         caller_user_id, req.receiver_user_id,
     )
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            prof = await client.get(
-                f"{SUPABASE_URL}/rest/v1/public_profiles",
-                params={"select": "user_id,nick_name", "user_id": f"eq.{caller_user_id}"},
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+        # Only an ACTIVE pair can notify each other (handoff §14: "Red Room
+        # message — 11.3.1 for active pair"); otherwise anyone could push
+        # "new message" alerts to any member.
+        if not await latest_match_between(caller_user_id, req.receiver_user_id, active=True):
+            logger.warning(
+                "[chat-notify-unread] no active connection sender=%s receiver=%s — skipping",
+                caller_user_id, req.receiver_user_id,
             )
-            sender_label = "Someone"
-            if prof.status_code < 300 and prof.json():
-                sender_label = prof.json()[0].get("nick_name") or "Someone"
+            return {"ok": True, "skipped": "no_active_connection"}
 
         # 2026-10-12 spec: Red Room unread messages → PUSH ONLY, no email.
         # Chat is a push-friendly interaction (lock-screen prompt, open and
@@ -1445,10 +1808,12 @@ async def chat_notify_unread_message(
         #     real-time chat. send_push_notification only accepts the
         #     window in hours, so 10 seconds is passed as 10/3600 h.
         from push_notifications import send_push_notification
+        # Generic lock-screen preview by default (handoff §14) — no sender
+        # name or message text on the lock screen.
         await send_push_notification(
             user_id=req.receiver_user_id,
-            title=f"{sender_label} sent you a message 💬",
-            body="Tap to open your Red Room.",
+            title="New message in your Red Room",
+            body="Open CheriPic to read it.",
             campaign="red_room_message_unread",
             url=f"/#/chat/{caller_user_id}",
             dedup_window_hours=10 / 3600,
@@ -1467,7 +1832,9 @@ class NotifyAssessmentCompletedRequest(BaseModel):
 
 
 @app.post("/assessment/notify-completed", tags=["Assessment"])
+@limiter.limit(RATE_LIMITS["notify"])
 async def assessment_notify_completed(
+    request: Request,
     req: NotifyAssessmentCompletedRequest,
     caller_user_id: str = Depends(get_current_user_id),
 ):
@@ -1538,12 +1905,61 @@ async def matching_finalize_partnership(
             status_code = 404
         elif code == "not_a_participant":
             status_code = 403
-        elif code == "both_must_accept_first":
-            status_code = 409  # conflict — not yet ready
+        elif code in ("both_must_accept_first", "match_inactive", "already_official_elsewhere", "state_changed"):
+            status_code = 409  # conflict — authoritative state differs
+        elif code.startswith(("PATCH ", "DELETE ", "POST ")):
+            # Upstream write failure inside the sweep — retryable, and don't
+            # echo PostgREST error text to the client.
+            logger.error("[partnership] finalize write failed: %s", code)
+            raise HTTPException(status_code=502, detail="finalize_failed")
         raise HTTPException(status_code=status_code, detail=code)
     except Exception as e:
         logger.error("[partnership] finalize failed: %r", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"finalize_failed: {e}")
+        raise HTTPException(status_code=500, detail="finalize_failed")
+
+
+@app.post("/matching/withdraw-interest", tags=["Matching"])
+@limiter.limit(RATE_LIMITS["withdraw_interest"])
+async def matching_withdraw_interest(
+    request: Request,
+    req: WithdrawInterestRequest,
+    caller_user_id: str = Depends(get_current_user_id),
+):
+    """
+    11.2B.1 · Withdraw a pending interest the caller sent. Conditional on the
+    request still being pending, so a concurrent accept/decline wins cleanly
+    and the caller gets 409 with the authoritative `state`.
+    """
+    try:
+        return await withdraw_interest(req.request_id, caller_user_id)
+    except MemberActionError as e:
+        code = str(e)
+        status_code = {"request_not_found": 404, "not_sender": 403, "not_pending": 409}.get(code, 500)
+        raise HTTPException(status_code=status_code, detail={"code": code, "state": e.state})
+
+
+@app.post("/account/delete", tags=["Account"])
+@limiter.limit(RATE_LIMITS["account_delete"])
+async def account_delete(request: Request, caller_user_id: str = Depends(get_current_user_id)):
+    """
+    12.1.1 · Permanently delete the caller's account (cancels Stripe billing,
+    removes member data and media, then deletes the auth user). Retryable.
+    The id comes only from the verified JWT — never from the body.
+    """
+    logger.info("[delete-account] requested by %s", caller_user_id)
+    try:
+        result = await delete_account(caller_user_id)
+    except MemberActionError as e:
+        code = str(e)
+        # Billing/storage/upstream failures are retryable: nothing is
+        # reported as deleted and the login still exists for the retry.
+        status_code = 502 if code in ("billing_cancel_failed", "billing_lookup_failed") else 500
+        raise HTTPException(status_code=status_code, detail={"code": code, "retryable": True})
+    # Drop any cached token→user mapping so a still-unexpired access token
+    # for the deleted account stops working on this backend immediately.
+    from auth import forget_user
+    forget_user(caller_user_id)
+    return result
 
 
 @app.post("/auth/send-email-hook", tags=["Auth"])
@@ -1732,7 +2148,9 @@ async def admin_wipe_dedup_queue(
 
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
+@limiter.limit(RATE_LIMITS["chat"])
 async def chat(
+    request: Request,
     req: ChatRequest,
     background_tasks: BackgroundTasks,
     user_id: str = Depends(get_current_user_id),
@@ -1771,6 +2189,10 @@ async def chat(
         period = await billing.get_quota_period(user_id)
         used = await billing.get_period_usage(user_id, period["period_start"])
         capped = None if math.isinf(limit) else int(limit)
+        background_tasks.add_task(
+            _record_ai_usage,
+            build_usage_ledger_row(user_id=user_id, purpose="chat", tier=tier, model="", usage=None, canned=True),
+        )
 
         return ChatResponse(
             reply=reply_text,
@@ -1803,10 +2225,7 @@ async def chat(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail={
                 "error": "cheri_ai_monthly_limit_reached",
-                "message": (
-                    f"I'm sorry, but our time together has come to an end for now."
-                    f"I'd really like to continue this conversation with you. Upgrade your plan whenever you're ready, and we'll pick up right where we left off."
-                ),
+                "message": f"You've used this period's CheriAI messages. Your allowance resets {resets}.",
                 "tier": tier,
                 "monthly_used": used,
                 "monthly_limit": int(limit),
@@ -1819,11 +2238,34 @@ async def chat(
             },
         )
 
+    # Atomic reservation (migration 050 RPC): closes the read-check-write
+    # race where parallel requests could all pass the check above. None =
+    # RPC not deployed → legacy increment-after-success path below.
+    reserved = await billing.try_reserve_message(
+        user_id, period["period_start"], None if math.isinf(limit) else int(limit)
+    )
+    _has_reservation = isinstance(reserved, int) and not isinstance(reserved, bool)
+    if reserved is False:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "error": "cheri_ai_monthly_limit_reached",
+                "message": "You've used this period's CheriAI messages. Your allowance resets "
+                + ("when your plan renews." if period["source"] == "billing_cycle" else "at the start of next month (UTC)."),
+                "tier": tier,
+                "monthly_used": used,
+                "monthly_limit": None if math.isinf(limit) else int(limit),
+                "period_start": period["period_start"],
+                "period_end": period["period_end"],
+                "daily_used": used,
+                "daily_limit": None if math.isinf(limit) else int(limit),
+            },
+        )
+
     try:
         # Profile is optional — if missing, prompt builder uses defaults
         user_data = await fetch_user_profile(user_id) or {"id": user_id, "nick_name": "Friend"}
-        if user_data.get("nick_name"):
-            logger.info(f"Profile loaded: {user_data.get('nick_name')}")
+        logger.info("Profile loaded: %s", "yes" if user_data.get("user_id") else "default")
 
         # Load memory + recent messages first (in parallel), then offers (which
         # Memory + recent messages only — we intentionally do NOT call
@@ -1846,13 +2288,24 @@ async def chat(
         logger.info("Calling LLM...")
         # json_mode locks Cheri's reply into {"reply": ..., "follow_up": ...}
         # so the second bubble can't get glued onto the first.
-        llm_reply = await send_to_llm(full_prompt, user=user_id, json_mode=True)
+        llm_reply, llm_usage = await send_to_llm_with_usage(full_prompt, user=user_id, json_mode=True)
         logger.info(f"LLM reply received ({len(llm_reply)} chars)")
+        background_tasks.add_task(
+            _record_ai_usage,
+            build_usage_ledger_row(
+                user_id=user_id, purpose="chat", tier=tier,
+                model=(llm_usage or {}).get("model") or llm_client.OPENAI_MODEL, usage=llm_usage,
+            ),
+        )
 
         # Split into main bubble + optional follow-up bubble. Cheri is now
         # asked for JSON output via OpenAI's json_mode; the parser falls
         # back to text splitting if anything ever drifts.
         reply_text, follow_up = _split_reply_and_followup(llm_reply)
+        if not reply_text:
+            # Model returned JSON without reply text — don't save or show it.
+            logger.warning("[chat] empty parsed reply for user=%s", user_id)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="CheriAI couldn't reply just now. Please try again.")
         logger.info(
             "Parsed reply: main=%d chars, follow_up=%s",
             len(reply_text),
@@ -1893,8 +2346,12 @@ async def chat(
         )
 
         # Bump the period counter only AFTER a successful LLM call so failed
-        # requests don't eat into the user's quota.
-        new_used = await billing.increment_period_usage(user_id, period["period_start"])
+        # requests don't eat into the user's quota (already counted when the
+        # atomic reservation succeeded).
+        if _has_reservation:
+            new_used = reserved
+        else:
+            new_used = await billing.increment_period_usage(user_id, period["period_start"])
 
         return ChatResponse(
             reply=reply_text,
@@ -1912,12 +2369,16 @@ async def chat(
         )
 
     except HTTPException:
+        if _has_reservation:
+            await billing.release_message(user_id, period["period_start"])
         raise
     except Exception as e:
-        logger.error(f"Chat endpoint error: {e}", exc_info=True)
+        if _has_reservation:
+            await billing.release_message(user_id, period["period_start"])
+        logger.error(f"Chat endpoint error: {e!r}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Chat processing failed: {str(e)}"
+            detail="CheriAI couldn't reply just now. Please try again.",
         )
 
 
@@ -2020,7 +2481,8 @@ class VerifyFaceResponse(BaseModel):
 
 
 @app.post("/kyc/verify-face", response_model=VerifyFaceResponse, tags=["KYC"])
-async def verify_face(req: VerifyFaceRequest, user_id: str = Depends(get_current_user_id)):
+@limiter.limit(RATE_LIMITS["verify_face"])
+async def verify_face(request: Request, req: VerifyFaceRequest, user_id: str = Depends(get_current_user_id)):
     """
     Compare a user's live selfie against the face on their ID-proof image
     and, if the similarity is >= threshold, mark them verified.
@@ -2032,6 +2494,17 @@ async def verify_face(req: VerifyFaceRequest, user_id: str = Depends(get_current
     logger.info(
         "Face verify | user=%s threshold=%.1f", user_id, req.threshold
     )
+    # The server downloads these URLs, so only accept CheriPic storage
+    # objects inside the caller's own folder: blocks SSRF to internal hosts
+    # and scoring someone else's ID/selfie.
+    if not (
+        is_own_storage_image_url(req.face_image_url, user_id)
+        and is_own_storage_image_url(req.id_image_url, user_id)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Images must be uploaded to your own CheriPic storage before verification.",
+        )
 
     try:
         result = await compare_faces(
@@ -2064,10 +2537,10 @@ async def verify_face(req: VerifyFaceRequest, user_id: str = Depends(get_current
             ),
         )
     except Exception as e:
-        logger.error("Face verify error for %s: %s", user_id, e, exc_info=True)
+        logger.error("Face verify error for %s: %r", user_id, e, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Face verification failed: {e}",
+            detail="Face verification failed. Please try again.",
         )
 
     # Admin-approval workflow:
@@ -2134,15 +2607,15 @@ async def create_checkout_session(
         url = await billing.create_checkout_session(
             user_id=user_id,
             price_id=req.price_id,
-            success_url=req.success_url,
-            cancel_url=req.cancel_url,
+            success_url=_safe_return_url(req.success_url, "/#/profile?checkout=success"),
+            cancel_url=_safe_return_url(req.cancel_url, "/#/pricing"),
         )
         return CreateCheckoutResponse(url=url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error("Stripe checkout error: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Stripe checkout error: %r", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not start checkout. Please try again.")
 
 
 class PortalSessionRequest(BaseModel):
@@ -2170,14 +2643,14 @@ async def create_billing_portal_session(
     try:
         url = await billing.create_portal_session(
             user_id=user_id,
-            return_url=req.return_url,
+            return_url=_safe_return_url(req.return_url),
         )
         return PortalSessionResponse(url=url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error("Stripe portal error: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("Stripe portal error: %r", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not open billing management. Please try again.")
 
 
 @app.post("/billing/webhook", tags=["Billing"])
@@ -2191,11 +2664,15 @@ async def stripe_webhook(request: Request):
     try:
         summary = await billing.handle_event(payload, signature)
         return summary
+    except billing.WebhookSignatureError as e:
+        logger.warning("Stripe webhook rejected: %s", e)
+        raise HTTPException(status_code=400, detail="invalid_signature")
     except Exception as e:
-        logger.error("Stripe webhook error: %s", e, exc_info=True)
-        # Return 400 so Stripe retries — but signature errors should NOT
-        # retry indefinitely (Stripe stops after a few attempts).
-        raise HTTPException(status_code=400, detail=str(e))
+        # Processing failed AFTER verification. handle_event released the
+        # idempotency claim, so a non-2xx makes Stripe redeliver and the
+        # retry reprocesses the event instead of skipping it as a duplicate.
+        logger.error("Stripe webhook error: %r", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="webhook_processing_failed")
 
 
 @app.get("/billing/me/{user_id}", tags=["Billing"])
@@ -2268,7 +2745,7 @@ async def get_cheri_thread(
         logger.error(f"Error loading Cheri thread: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to load thread: {str(e)}",
+            detail="Failed to load your conversation.",
         )
 
 
@@ -2306,7 +2783,7 @@ async def get_conversation(
         logger.error(f"Error retrieving conversation: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve conversation: {str(e)}"
+            detail="Failed to retrieve conversation."
         )
 
 
@@ -2341,7 +2818,7 @@ async def list_user_conversations(user_id: str, authed: str = Depends(get_curren
         logger.error(f"Error listing conversations: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list conversations: {str(e)}"
+            detail="Failed to list conversations."
         )
 
 

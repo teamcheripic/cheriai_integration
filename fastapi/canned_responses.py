@@ -82,14 +82,19 @@ PATTERNS: dict[str, set[str]] = {
         "are you real", "are you human", "are you a bot", "are you ai",
         "are you an ai", "what are you", "are u human", "are u a bot",
     },
+    # "help" / "help me" are deliberately NOT here: they can be a distress
+    # signal and must reach the LLM (design rule 3 — false positives harm).
     "capability": {
-        "help", "help me", "what can you do", "what do you do",
+        "what can you do", "what do you do",
         "how does this work", "how do you work", "what is this",
         "what is cheripic", "what is cheri", "what can u do",
     },
     "affirmation": {
+        # Bare "no" / "nope" / "nah" are NOT canned: as an answer to Cheri's
+        # last question ("are you safe?", "is it getting better?") they carry
+        # meaning the LLM must see.
         "ok", "okay", "k", "kk", "cool", "sure", "yes", "yeah", "yep",
-        "ya", "yup", "no", "nope", "nah", "nice", "great", "awesome",
+        "ya", "yup", "nice", "great", "awesome",
         "alright", "fine", "got it", "makes sense",
     },
 }
@@ -192,13 +197,15 @@ _POOLS: dict[str, list[dict[str, str]]] = {
             "follow_up": "What's actually on your mind right now?",
         },
     ],
+    # Handoff 10B1 "Clearly disclose AI": every identity reply says CheriAI is
+    # an AI, not a person and not a therapist.
     "identity": [
         {
-            "reply": "I'm Cheri — your CheriPic companion. I help you reflect on connection, dating, and what matters most to you.",
+            "reply": "I'm CheriAI — an AI, not a person and not a therapist. I help you reflect on connection, dating, and what matters most to you.",
             "follow_up": "Anything specific you'd like to talk through?",
         },
         {
-            "reply": "I'm Cheri — think of me as a thoughtful coach for the questions we don't always say out loud.",
+            "reply": "I'm CheriAI, an AI companion for the questions we don't always say out loud. I'm not a human or a therapist, and I can get things wrong.",
         },
     ],
     "capability": [

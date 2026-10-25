@@ -90,6 +90,16 @@ class SupabaseRest:
                 )
             return resp.json() if resp.content else []
 
+    async def delete(self, table: str, *, eq: dict[str, Any]) -> None:
+        """DELETE /rest/v1/<table>?<col>=eq.<val>&... (refuses an unfiltered delete)."""
+        if not eq:
+            raise ValueError("delete() requires an eq filter — refusing to delete every row.")
+        params = {col: f"eq.{val}" for col, val in eq.items()}
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.delete(f"{self._base}/{table}", params=params, headers=self._headers)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Supabase delete on {table} failed [{resp.status_code}]: {resp.text}")
+
     async def upsert(
         self,
         table: str,

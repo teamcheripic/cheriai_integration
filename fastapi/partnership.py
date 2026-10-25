@@ -50,6 +50,15 @@ Rules preserved from the user's spec:
     • Messages between the two partners are KEPT
     • Third parties always get a partner_dropped notification (step 3d)
     • Cleanup is idempotent — safe to re-run
+
+Atomic path (migration 049, NOT APPLIED — needs approval):
+    The app calls the accept_official_request RPC first, which does steps
+    1–5's DATA changes in one transaction with row locks (and records an
+    'accepted' official_request_events row). It then calls this endpoint;
+    partnered_at is already set, so the stamp is skipped and the notices
+    are sent only if this call CLAIMS the RPC's unprocessed event. Until
+    049 is applied the event table is absent and everything above runs as
+    the (guarded, conditional) fallback.
 """
 
 from __future__ import annotations
@@ -148,6 +157,75 @@ async def _pg_post_soft(client: httpx.AsyncClient, path: str, payload: dict[str,
         return False
 
 
+# --------------------------------------------------------------------------
+# official_request_events (migration 049, NOT APPLIED yet)
+#
+# When 049 is applied the app commits the official pair atomically with the
+# accept_official_request RPC (row locks, one transaction) and then calls
+# /matching/finalize-partnership only for the side effects that must not run
+# inside a DB transaction (notices, emails, push, notification sweep). The
+# RPC writes an 'accepted' event with processed_at NULL plus the list of
+# side matches it closed; this module CLAIMS that event (conditional PATCH
+# processed_at IS NULL → now) so the celebration notices and third-party
+# notices are sent exactly once, even with concurrent/retried finalize calls.
+#
+# Every helper here is soft: a missing table (PGRST205 / 42P01 → 404/400)
+# means "049 not applied" and the legacy path below runs unchanged.
+# --------------------------------------------------------------------------
+_EVENTS = "official_request_events"
+
+
+async def _claim_accepted_events(client: httpx.AsyncClient, match_id: str) -> list[dict[str, Any]]:
+    """Claim the RPC's unprocessed 'accepted' event(s) for this match. [] when none / table missing."""
+    try:
+        resp = await client.patch(
+            f"{_PG_BASE}/{_EVENTS}",
+            params={"match_id": f"eq.{match_id}", "event": "eq.accepted", "processed_at": "is.null"},
+            json={"processed_at": datetime.now(timezone.utc).isoformat()},
+            headers=_PG_HEADERS,
+            timeout=15.0,
+        )
+        if resp.status_code >= 300:
+            return []
+        rows = resp.json()
+        return rows if isinstance(rows, list) else []
+    except Exception as e:  # network blip → treat as nothing to claim (self-heal path still runs)
+        logger.warning("[partnership] event claim failed: %r", e)
+        return []
+
+
+async def _release_claim(client: httpx.AsyncClient, event_ids: list[str]) -> None:
+    """Undo a claim when sending the side effects failed, so a retry sends them."""
+    if not event_ids:
+        return
+    try:
+        await client.patch(
+            f"{_PG_BASE}/{_EVENTS}",
+            params={"id": f"in.({','.join(event_ids)})"},
+            json={"processed_at": None},
+            headers=_PG_HEADERS,
+            timeout=15.0,
+        )
+    except Exception as e:
+        logger.warning("[partnership] event claim release failed: %r", e)
+
+
+async def record_official_event(
+    client: httpx.AsyncClient,
+    match_id: str,
+    actor_id: str | None,
+    event: str,
+    *,
+    processed: bool = True,
+    details: dict[str, Any] | None = None,
+) -> bool:
+    """Append to official_request_events (service role). Soft: False when the table is missing."""
+    row: dict[str, Any] = {"match_id": match_id, "actor_id": actor_id, "event": event, "details": details or {}}
+    if processed:
+        row["processed_at"] = datetime.now(timezone.utc).isoformat()
+    return await _pg_post_soft(client, _EVENTS, row)
+
+
 async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, Any]:
     """
     Finalize the partnership referenced by `match_id` on behalf of
@@ -182,6 +260,29 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
 
         partner_ids = [m["user_a_id"], m["user_b_id"]]
 
+        # Handoff §13 "Make/accept official": neither member may already be
+        # official elsewhere. Without this, two pending proposals involving
+        # the same member could both be finalized and each sweep would
+        # deactivate the other official pair. (Narrows, but cannot fully
+        # close, the race without a DB-side transaction — see the drafted
+        # accept_official_request RPC in migrations/049, NOT APPLIED.)
+        if not m.get("partnered_at"):
+            ids_csv = ",".join(partner_ids)
+            elsewhere = await _pg_get(
+                client,
+                "matches",
+                {
+                    "select": "id",
+                    "id": f"neq.{match_id}",
+                    "is_active": "eq.true",
+                    "partnered_at": "not.is.null",
+                    "or": f"(user_a_id.in.({ids_csv}),user_b_id.in.({ids_csv}))",
+                    "limit": "1",
+                },
+            )
+            if elsewhere:
+                raise PartnershipError("already_official_elsewhere")
+
         # ---- Stamp partnered_at only if not already set ----
         # Prior versions of this file short-circuited the ENTIRE sweep
         # when partnered_at was already set. That created a footgun:
@@ -199,13 +300,65 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
         already_partnered_at = m.get("partnered_at")
         now_iso = datetime.now(timezone.utc).isoformat()
         if not already_partnered_at:
-            await _pg_patch(
-                client,
-                "matches",
-                {"id": f"eq.{match_id}"},
-                {"partnered_at": now_iso},
+            # Conditional stamp: only a still-active, mutually-accepted,
+            # not-yet-official row changes. If a withdraw/end raced us, zero
+            # rows match and we report the authoritative state instead of
+            # committing an official pair that no longer exists.
+            resp = await client.patch(
+                f"{_PG_BASE}/matches",
+                params={
+                    "id": f"eq.{match_id}",
+                    "is_active": "eq.true",
+                    "partner_accepted_by_a": "eq.true",
+                    "partner_accepted_by_b": "eq.true",
+                    "partnered_at": "is.null",
+                },
+                json={"partnered_at": now_iso},
+                headers=_PG_HEADERS,
+                timeout=15.0,
             )
+            if resp.status_code >= 300:
+                raise PartnershipError(f"PATCH matches failed [{resp.status_code}]: {resp.text[:200]}")
+            if not resp.json():
+                again = await _pg_get(
+                    client,
+                    "matches",
+                    {"select": "is_active,partnered_at,partner_accepted_by_a,partner_accepted_by_b",
+                     "id": f"eq.{match_id}", "limit": "1"},
+                )
+                cur = again[0] if again else {}
+                if cur.get("partnered_at") and cur.get("is_active"):
+                    # A concurrent finalize by the other member won — fine,
+                    # carry on with the (idempotent) sweep using its stamp.
+                    already_partnered_at = cur["partnered_at"]
+                else:
+                    raise PartnershipError("state_changed")
         stamped_at = already_partnered_at or now_iso
+
+        # ---- Who owes the side effects (notices / emails)? ----
+        #   • legacy path: this call stamped partnered_at just now;
+        #   • RPC path (049 applied): accept_official_request stamped it in
+        #     one transaction and left an unprocessed 'accepted' event —
+        #     whoever claims it sends the notices, exactly once.
+        claimed: list[dict[str, Any]] = []
+        if already_partnered_at:
+            claimed = await _claim_accepted_events(client, match_id)
+        else:
+            await record_official_event(
+                client, match_id, caller_user_id, "accepted", details={"source": "backend_finalize"},
+            )
+        send_side_effects = (not already_partnered_at) or bool(claimed)
+        claimed_ids = [str(ev["id"]) for ev in claimed if ev.get("id")]
+        # Side matches the RPC already closed (so step 3 below won't see them
+        # as active): their third parties still get partner_dropped +
+        # connection_lost, as in the legacy sweep.
+        rpc_closed: list[tuple[str, str]] = []
+        for ev in claimed:
+            details = ev.get("details") or {}
+            for c in details.get("closed") or []:
+                partner_uid, third_party = c.get("partner"), c.get("third_party")
+                if partner_uid in partner_ids and third_party and third_party not in partner_ids:
+                    rpc_closed.append((partner_uid, third_party))
 
         # ---- 2b. Notify both partners that the partnership is now
         # official. Only fires when we STAMPED partnered_at just now
@@ -213,8 +366,9 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
         # already-partnered pair skips this, so users don't get
         # duplicate "You made it official" notifications every time
         # the sweep re-runs. Service-role client, so RLS on
-        # notifications can't drop the cross-user writes.
-        if not already_partnered_at:
+        # notifications can't drop the cross-user writes. On the RPC path
+        # (049) "first time" means "claimed the unprocessed accepted event".
+        if send_side_effects:
             # Soft — a CHECK constraint miss (migration 029 not applied)
             # must NOT abort the sweep. Losing the celebration notif is
             # far better than leaving stale side-matches lingering.
@@ -244,14 +398,19 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
             # Scenario 8 of the 2026-10-08 event-email spec: send both
             # partners the celebration email with the other person's
             # name. Load nick_names once; one send per partner.
-            nick_rows = await _pg_get(
-                client,
-                "public_profiles",
-                {
-                    "select": "user_id,nick_name",
-                    "user_id": f"in.({partner_ids[0]},{partner_ids[1]})",
-                },
-            )
+            try:
+                nick_rows = await _pg_get(
+                    client,
+                    "public_profiles",
+                    {
+                        "select": "user_id,nick_name",
+                        "user_id": f"in.({partner_ids[0]},{partner_ids[1]})",
+                    },
+                )
+            except Exception:
+                # Couldn't finish the notices: un-claim so a retry sends them.
+                await _release_claim(client, claimed_ids)
+                raise
             nick_by_id = {r["user_id"]: (r.get("nick_name") or "your partner") for r in nick_rows}
             # Push auto-fires via NOTIFICATION_REGISTRY after each
             # email — partner_proposal_accepted has push_config with
@@ -273,6 +432,54 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
         # ---- 3. Sweep side matches for both partners ----
         side_matches_deactivated = 0
         third_parties_notified: set[str] = set()
+
+        async def notify_third_party(uid: str, third_party: str) -> None:
+            """Step 3d: partner_dropped notice + connection_lost email, deduped."""
+            # (d) Notify the third party — dedup against existing rows
+            existing = await _pg_get(
+                client,
+                "notifications",
+                {
+                    "select": "id",
+                    "user_id": f"eq.{third_party}",
+                    "type": "eq.partner_dropped",
+                    "related_user_id": f"eq.{uid}",
+                    "limit": "1",
+                },
+            )
+            if not existing:
+                # Soft — CHECK constraint / RLS misconfig on this
+                # single row must not abort the sweep for OTHER
+                # third parties or the trailing steps.
+                inserted_ok = await _pg_post_soft(
+                    client,
+                    "notifications",
+                    {
+                        "user_id": third_party,
+                        "type": "partner_dropped",
+                        "title": "A connection has ended",
+                        # Handoff §14 / audit E H14S.16: never tell a third
+                        # party WHY the connection closed.
+                        "body": "Your connection has ended.",
+                        "related_user_id": uid,
+                    },
+                )
+                if inserted_ok:
+                    third_parties_notified.add(third_party)
+                    # Scenarios 4+5 of the 2026-10-08 event-email spec:
+                    # someone the third party was mutually matched with
+                    # just partnered elsewhere. Email the connection_lost
+                    # template; its copy is neutral (transactional_email.
+                    # NEUTRAL_COPY_OVERRIDES — no reason disclosed). Dedup window
+                    # 24h — one email per losing-connection event, even
+                    # if the sweep re-runs during a self-heal retry.
+                    await send_transactional_email(
+                        user_id=third_party,
+                        template_slug="connection_lost",
+                        dedup_window_hours=24,
+                        related_user_id=uid,
+                    )
+                    # Push auto-fires via NOTIFICATION_REGISTRY (connection_lost).
 
         for uid in partner_ids:
             side_matches = await _pg_get(
@@ -315,59 +522,17 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
 
                 side_matches_deactivated += 1
 
-                # (d) Notify the third party — dedup against existing rows
-                existing = await _pg_get(
-                    client,
-                    "notifications",
-                    {
-                        "select": "id",
-                        "user_id": f"eq.{third_party}",
-                        "type": "eq.partner_dropped",
-                        "related_user_id": f"eq.{uid}",
-                        "limit": "1",
-                    },
-                )
-                if not existing:
-                    # Soft — CHECK constraint / RLS misconfig on this
-                    # single row must not abort the sweep for OTHER
-                    # third parties or the trailing steps.
-                    inserted_ok = await _pg_post_soft(
-                        client,
-                        "notifications",
-                        {
-                            "user_id": third_party,
-                            "type": "partner_dropped",
-                            "title": "A connection has ended",
-                            "body": (
-                                "Your connection is now in a committed "
-                                "partnership. Wishing you well as you continue "
-                                "your journey."
-                            ),
-                            "related_user_id": uid,
-                        },
-                    )
-                    if inserted_ok:
-                        third_parties_notified.add(third_party)
-                        # Scenarios 4+5 of the 2026-10-08 event-email spec:
-                        # someone the third party was mutually matched with
-                        # just partnered elsewhere. Email the connection_lost
-                        # template with a context line that reads naturally
-                        # from the third party's perspective. Dedup window
-                        # 24h — one email per losing-connection event, even
-                        # if the sweep re-runs during a self-heal retry.
-                        await send_transactional_email(
-                            user_id=third_party,
-                            template_slug="connection_lost",
-                            extra_vars={
-                                "context_line": (
-                                    "A connection you were building with has "
-                                    "chosen to make it official with someone else."
-                                ),
-                            },
-                            dedup_window_hours=24,
-                            related_user_id=uid,
-                        )
-                        # Push auto-fires via NOTIFICATION_REGISTRY (connection_lost).
+                await notify_third_party(uid, third_party)
+
+        # RPC path: side matches were closed inside accept_official_request;
+        # their third parties are notified here (only by the claimer).
+        for partner_uid, third_party in rpc_closed:
+            try:
+                await notify_third_party(partner_uid, third_party)
+            except Exception:
+                await _release_claim(client, claimed_ids)
+                raise
+        side_matches_deactivated += len(rpc_closed)
 
         # ---- 3.5. Collect third parties with PENDING interests touching
         # either partner, BEFORE step 4 deletes those rows. These users
@@ -410,12 +575,6 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
             await send_transactional_email(
                 user_id=tp,
                 template_slug="connection_lost",
-                extra_vars={
-                    "context_line": (
-                        "A connection you were exploring has chosen to make "
-                        "it official with someone else."
-                    ),
-                },
                 dedup_window_hours=24,
                 related_user_id=partner_uid,
             )
@@ -537,6 +696,9 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
             "match_id": match_id,
             "partnered_at": stamped_at,
             "already_finalized": bool(already_partnered_at),
+            # True when THIS call sent the official notices (legacy stamp, or
+            # it claimed the accept_official_request RPC's event).
+            "side_effects_sent": send_side_effects,
             "side_matches_deactivated": side_matches_deactivated,
             "third_parties_notified": len(third_parties_notified),
             "requests_deleted": requests_deleted,

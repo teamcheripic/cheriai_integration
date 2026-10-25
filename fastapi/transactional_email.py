@@ -251,6 +251,9 @@ async def send_transactional_email(
         }
         if extra_vars:
             ctx.update({k: ("" if v is None else str(v)) for k, v in extra_vars.items()})
+        # H14S.16 · neutral third-party copy wins over whatever a caller
+        # passed (never "official with someone else" / "committed").
+        ctx.update(NEUTRAL_COPY_OVERRIDES.get(template_slug, {}))
 
         # 3+5+6. Load template, render, send + audit. If the template
         # row is missing we SKIP the email send but still fall through
@@ -312,8 +315,8 @@ async def send_transactional_email(
                 )
             if email_ok:
                 logger.info(
-                    "[transactional_email] sent %s to %s (%s) resend_id=%s",
-                    template_slug, user_id, recipient, provider_id,
+                    "[transactional_email] sent %s to %s resend_id=%s",
+                    template_slug, user_id, provider_id,
                 )
             else:
                 logger.warning(
@@ -366,6 +369,57 @@ async def send_transactional_email(
 
 
 # =============================================================================
+# H14S.16 · Third parties are never told WHY a connection closed. When a
+# member makes it official with someone else, everyone else they were
+# connected to / exploring gets the same neutral line as any other ending.
+# Applied after extra_vars, so a caller can't reintroduce the reason.
+# =============================================================================
+NEUTRAL_CONNECTION_ENDED_LINE = "One of your connections on CheriPic has ended."
+NEUTRAL_COPY_OVERRIDES: dict[str, dict[str, str]] = {
+    "connection_lost": {"context_line": NEUTRAL_CONNECTION_ENDED_LINE},
+}
+
+
+async def send_template_to_address(
+    to: str,
+    template_slug: str,
+    name: str | None = None,
+    extra_vars: dict[str, Any] | None = None,
+) -> bool:
+    """
+    Send a template to a known address WITHOUT reading user_profiles —
+    for the account-deletion confirmation, where the profile row is already
+    gone. No preference check, dedup, audit row or push. Never raises; a
+    missing template is a logged soft failure (returns False).
+    """
+    if not to or "@" not in to:
+        return False
+    try:
+        template = await _load_template(template_slug)
+        if not template:
+            logger.warning("[transactional_email] template '%s' missing — email skipped", template_slug)
+            return False
+        ctx: dict[str, Any] = {
+            "name": name or to.split("@")[0],
+            "app_url": await _cfg_app_base_url(),
+            "logo_url": await _cfg_logo_url(),
+            "support_email": await _cfg_support_email(),
+            "unsubscribe_url": await _cfg_unsubscribe_url(),
+        }
+        if extra_vars:
+            ctx.update({k: ("" if v is None else str(v)) for k, v in extra_vars.items()})
+        subject = _apply_template_vars(template["subject"], ctx)
+        html = _apply_template_vars(template["html_body"], ctx)
+        text = _apply_template_vars(template.get("text_body") or "", ctx)
+        async with httpx.AsyncClient() as client:
+            ok, _ = await send_email(client, to, subject, html, text)
+        return bool(ok)
+    except Exception as e:
+        logger.warning("[transactional_email] direct send of %s failed: %r", template_slug, e)
+        return False
+
+
+# =============================================================================
 # NOTIFICATION_REGISTRY — single source of truth for which campaigns
 # push alongside their email, with the push copy templated against the
 # same {{var}} context the email uses. Add a slug here → every call to
@@ -374,51 +428,56 @@ async def send_transactional_email(
 # =============================================================================
 NOTIFICATION_REGISTRY: dict[str, dict[str, Any]] = {
     # --- Matching flow (both channels) --------------------------------
+    # Handoff §14: "Use generic lock-screen previews by default for
+    # sensitive relationship events." Push copy below therefore never names
+    # the other member or discloses why something happened (e.g. that a
+    # connection partnered elsewhere); the email/in-app inbox carries the
+    # detail once the member opens the app.
     "interest_received": {
-        "title": "{{other_name}} is interested in you",
-        "body":  "Open your requests to decide.",
+        "title": "You have a new interest",
+        "body":  "Open CheriPic to review it.",
         "url":   "/#/matching?tab=received",
         "dedup_window_hours": 1,
     },
     "interest_accepted": {
-        "title": "{{other_name}} accepted your interest ✨",
-        "body":  "Tap to open your Red Room.",
+        "title": "Good news on CheriPic ✨",
+        "body":  "One of your interests was accepted. Open CheriPic to see it.",
         "url":   "/#/matching?tab=sent",
         "dedup_window_hours": 1,
     },
     "interest_declined": {
         "title": "An update on your interest",
-        "body":  "They weren't ready this time — keep going.",
+        "body":  "Open CheriPic for details.",
         "url":   "/#/matching",
         "dedup_window_hours": 1,
     },
     "connection_lost": {
-        "title": "A connection has moved on",
-        "body":  "They partnered elsewhere. Discover is open.",
+        "title": "An update on your connections",
+        "body":  "Open CheriPic for details.",
         "url":   "/#/matching",
         "dedup_window_hours": 24,
     },
     "partner_proposal_received": {
-        "title": "{{other_name}} wants to make it official 💞",
-        "body":  "Open your Red Room to review and accept.",
+        "title": "You have a new request on CheriPic",
+        "body":  "Open your Red Room to review it.",
         "url":   "/#/chat/{{other_user_id}}",
         "dedup_window_hours": 1,
     },
     "partner_proposal_accepted": {
-        "title": "You and {{other_name}} are now partners 💞",
-        "body":  "{{other_name}} accepted your official request. Tap to open your Red Room.",
+        "title": "Your connection is now official 💞",
+        "body":  "Open CheriPic to continue in your Red Room.",
         "url":   "/#/chat/{{other_user_id}}",
         "dedup_window_hours": 24,
     },
     "partner_proposal_declined": {
-        "title": "An update on your Make-it-Official request",
-        "body":  "{{other_name}} wasn't ready this time.",
+        "title": "An update on your request",
+        "body":  "Open CheriPic for details.",
         "url":   "/#/matching",
         "dedup_window_hours": 1,
     },
     "relationship_ended": {
-        "title": "An update on your partnership",
-        "body":  "{{other_name}} has ended your CheriPic partnership. Tap for details.",
+        "title": "An update on your connection",
+        "body":  "Open CheriPic for details.",
         "url":   "/#/matching",
         "dedup_window_hours": 24,
     },

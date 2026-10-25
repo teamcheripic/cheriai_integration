@@ -216,6 +216,23 @@ async def get_current_admin_id(authorization: str = Header(default="")) -> str:
     return uid
 
 
+def cached_user_id(token: str) -> str | None:
+    """User id for a token verified within the last _CACHE_TTL seconds, else
+    None. Never verifies or trusts an unverified token — the rate limiter
+    uses this to bucket per member only after get_current_user_id ran."""
+    hit = _cache.get(token or "")
+    if hit and hit[0] > time.time():
+        return hit[1]
+    return None
+
+
+def forget_user(user_id: str) -> None:
+    """Drop every cached token that resolved to `user_id` (e.g. after the
+    account is deleted) so it is re-verified — and rejected — next time."""
+    for tok in [t for t, (_, uid) in _cache.items() if uid == user_id]:
+        _cache.pop(tok, None)
+
+
 def require_self(path_user_id: str, authed_user_id: str) -> None:
     """
     Guard for endpoints that still carry a `user_id` in the URL path (kept for

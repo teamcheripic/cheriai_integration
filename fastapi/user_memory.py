@@ -18,7 +18,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from llm_client import send_to_llm
+from llm_client import build_usage_ledger_row, send_to_llm_with_usage
 from supabase_client import supabase
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,31 @@ DISTILL_MAX_TOKENS = 220   # ~2x typical reply — enough for JSON output
 
 
 # --------------------------------------------------------------- READ helpers
+
+
+async def _ledger(user_id: str, purpose: str, usage: dict) -> None:
+    """
+    Usage-ledger row for background memory LLM calls (handoff §10: keep
+    assessment/memory cost separate from conversation). No prompt or reply
+    text. Needs public.ai_usage_ledger (migration 050); until then the row is
+    logged. Never raises — memory upkeep must not fail because of accounting.
+    """
+    try:
+        import billing  # local: avoid import cycles at module load
+
+        try:
+            tier = await billing.get_membership_tier(user_id)
+        except Exception:
+            tier = "unknown"
+        row = build_usage_ledger_row(
+            user_id=user_id, purpose=purpose, tier=tier, model=usage.get("model", ""), usage=usage
+        )
+        try:
+            await supabase.insert("ai_usage_ledger", row)
+        except Exception as e:
+            logger.info("[ai-usage] ledger unavailable (%s); row=%s", type(e).__name__, json.dumps(row))
+    except Exception as e:  # pragma: no cover - defensive
+        logger.info("[ai-usage] ledger row skipped: %r", e)
 
 async def load_memory(user_id: str) -> dict[str, Any]:
     """Returns {"summary": str, "insights": list, "turn_count": int}."""
@@ -215,11 +240,12 @@ async def seed_memory_from_profile(user_id: str) -> dict[str, Any]:
         # 2. Distill via LLM.
         current = await load_memory(user_id)
         prompt = _build_seed_prompt(row, bio)
-        raw = await send_to_llm(
+        raw, usage = await send_to_llm_with_usage(
             (_SEED_SYSTEM, prompt),
             max_tokens=DISTILL_MAX_TOKENS,
             user=user_id,
         )
+        await _ledger(user_id, "memory_seed", usage)
 
         # 3. Parse (lenient — model may wrap in prose despite instructions).
         text = raw.strip()
@@ -345,11 +371,12 @@ async def update_memory_async(
         prompt = _build_distill_prompt(
             current["summary"], current["insights"], user_message, assistant_reply
         )
-        raw = await send_to_llm(
+        raw, usage = await send_to_llm_with_usage(
             (_DISTILL_SYSTEM, prompt),
             max_tokens=DISTILL_MAX_TOKENS,
             user=user_id,
         )
+        await _ledger(user_id, "memory_distill", usage)
         logger.info(f"[memory] LLM returned {len(raw)} chars for {user_id}")
 
         # Be lenient about model formatting
@@ -357,9 +384,10 @@ async def update_memory_async(
         start = text.find("{")
         end = text.rfind("}")
         if start == -1 or end == -1:
+            # Length only: the distill output summarises the member's private
+            # conversation and must not be written to application logs.
             logger.warning(
-                f"[memory] distill returned no JSON for {user_id}. "
-                f"Raw response (first 300 chars): {text[:300]!r}"
+                f"[memory] distill returned no JSON for {user_id} ({len(text)} chars)"
             )
             await _touch_memory_row(user_id, current)
             return
@@ -368,8 +396,8 @@ async def update_memory_async(
             parsed = json.loads(text[start : end + 1])
         except json.JSONDecodeError as je:
             logger.warning(
-                f"[memory] JSON decode failed for {user_id}: {je}. "
-                f"Attempted: {text[start:end+1][:300]!r}"
+                f"[memory] JSON decode failed for {user_id}: {je.msg} at pos {je.pos} "
+                f"({end + 1 - start} chars)"
             )
             await _touch_memory_row(user_id, current)
             return

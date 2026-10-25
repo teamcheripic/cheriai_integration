@@ -92,10 +92,95 @@ class FaceMatchResult:
     threshold: float
 
 
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_KYC_BUCKETS = ("avatars", "kyc")
+
+
+def parse_kyc_storage_ref(ref: str) -> Optional[tuple[str, str]]:
+    """
+    `storage://<bucket>/<path>` (what the apps store in kyc_id_url /
+    kyc_face_url once the private `kyc` bucket exists — migration 048) →
+    (bucket, path). None for anything else or for path tricks.
+    """
+    if not isinstance(ref, str) or not ref.startswith("storage://"):
+        return None
+    from urllib.parse import unquote
+
+    bucket, _, path = ref[len("storage://"):].partition("/")
+    path = unquote(path)
+    if not bucket or not path or ".." in path or "//" in path or path.startswith("/") or "\\" in path:
+        return None
+    return bucket, path
+
+
+def is_own_storage_image_url(url: str, user_id: str) -> bool:
+    """
+    True only for a Supabase Storage object inside the member's own folder
+    (`<bucket>/<user_id>/...`), as written by both apps' uploaders — either a
+    `storage://kyc|avatars/<user_id>/…` reference or an object URL on this
+    project. Anything else — other hosts, internal addresses, other
+    members' folders, path tricks — is refused before we download it.
+    """
+    from urllib.parse import urlsplit, unquote
+
+    if not url or not user_id:
+        return False
+    ref = parse_kyc_storage_ref(url)
+    if ref is not None:
+        bucket, path = ref
+        return bucket in _KYC_BUCKETS and path.startswith(f"{user_id}/")
+    if url.startswith("storage://"):
+        return False
+    base = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    if not base:
+        return False
+    try:
+        u, b = urlsplit(url), urlsplit(base)
+    except ValueError:
+        return False
+    if u.scheme != b.scheme or u.scheme not in ("https", "http") or u.netloc != b.netloc:
+        return False
+    if u.username or u.password:
+        return False
+    path = unquote(u.path)
+    if ".." in path or "//" in path:
+        return False
+    for bucket in _KYC_BUCKETS:
+        for mode in ("public", "sign", "authenticated"):
+            if path.startswith(f"/storage/v1/object/{mode}/{bucket}/{user_id}/"):
+                return True
+    return False
+
+
+def _resolve_download(url: str) -> tuple[str, dict[str, str]]:
+    """
+    A `storage://` ref is fetched from the authenticated object endpoint with
+    the service key (private bucket; the key never leaves the server). Plain
+    object URLs (legacy public `avatars` uploads, signed URLs) are fetched
+    as-is.
+    """
+    ref = parse_kyc_storage_ref(url)
+    if ref is None:
+        return url, {}
+    from urllib.parse import quote
+
+    bucket, path = ref
+    base = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    key = os.getenv("SUPABASE_KEY") or ""
+    return (
+        f"{base}/storage/v1/object/authenticated/{bucket}/{quote(path)}",
+        {"apikey": key, "Authorization": f"Bearer {key}"},
+    )
+
+
 async def _download(url: str, suffix: str) -> str:
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        resp = await client.get(url)
+    target, headers = _resolve_download(url)
+    # No redirects: an allowed storage URL must not bounce us elsewhere.
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+        resp = await client.get(target, headers=headers)
         resp.raise_for_status()
+    if len(resp.content) > _MAX_IMAGE_BYTES:
+        raise ValueError("image too large")
     fd, path = tempfile.mkstemp(suffix=suffix)
     with os.fdopen(fd, "wb") as f:
         f.write(resp.content)
