@@ -56,6 +56,10 @@ RATE_LIMITS = {
     "sponsored_click": _rl("SPONSORED_CLICK", "60/minute"),
     "assessment_submit": _rl("ASSESSMENT_SUBMIT", "10/hour"),
     "connect_state": _rl("CONNECT_STATE", "20/minute"),
+    # Payment providers (payments_api.py)
+    "billing_checkout": _rl("BILLING_CHECKOUT", "10/minute"),
+    "billing_config": _rl("BILLING_CONFIG", "60/minute"),
+    "admin_payments": _rl("ADMIN_PAYMENTS", "30/minute"),
 }
 
 limiter = Limiter(

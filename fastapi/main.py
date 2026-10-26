@@ -90,6 +90,7 @@ FRONTEND_URLS = os.getenv(
 
 MAX_CHAT_MESSAGE_CHARS = 2000
 ALLOWED_CHAT_STAGES = frozenset({"general", "onboarding", "golden_questions", "matching"})
+CHAT_TOO_LONG_DETAIL = f"Your message is too long. Please keep it under {MAX_CHAT_MESSAGE_CHARS:,} characters."
 
 
 def _assert_production_config() -> None:
@@ -161,8 +162,9 @@ class ChatRequest(BaseModel):
     def message_not_empty(cls, v):
         if not v or len(v.strip()) == 0:
             raise ValueError("message cannot be empty")
-        if len(v) > MAX_CHAT_MESSAGE_CHARS:
-            raise ValueError(f"message must be at most {MAX_CHAT_MESSAGE_CHARS} characters")
+        # The length cap is enforced in the /chat handler (still 422) so the
+        # PWA, which renders `detail` verbatim in the chat bubble, gets a
+        # readable sentence instead of a pydantic error list.
         return v
 
     @validator('stage', always=True)
@@ -451,7 +453,7 @@ async def _rate_limit_exceeded(request: Request, exc: RateLimitExceeded):
 
 
 # --- Feature routers (added by integration) ---
-for _mod in ("media", "cheripass", "official", "readiness"):
+for _mod in ("media", "cheripass", "official", "readiness", "payments_api"):
     try:
         app.include_router(__import__(_mod).router)
     except ModuleNotFoundError:
@@ -2157,6 +2159,11 @@ async def chat(
 ):
     # user_id comes from the VERIFIED token — never from the request body.
     logger.info(f"Chat | User: {user_id} | Stage: {req.stage} | Length: {len(req.message)}")
+    if len(req.message) > MAX_CHAT_MESSAGE_CHARS:
+        raise HTTPException(
+            status_code=422,
+            detail=CHAT_TOO_LONG_DETAIL,
+        )
 
     # ---- Cheap intent router ------------------------------------------------
     # If the message is an obvious pleasantry (hi / thanks / how are you /
@@ -2604,7 +2611,10 @@ async def create_checkout_session(
 ):
     """Returns the Stripe-hosted checkout URL the frontend should redirect to."""
     try:
-        url = await billing.create_checkout_session(
+        # Delegates to the payment layer: Stripe active → the original
+        # Checkout Session path; another provider active → its hosted page.
+        from payments_api import legacy_checkout_session
+        url = await legacy_checkout_session(
             user_id=user_id,
             price_id=req.price_id,
             success_url=_safe_return_url(req.success_url, "/#/profile?checkout=success"),
@@ -2640,13 +2650,13 @@ async def create_billing_portal_session(
     method / viewing invoices. Only works once the user has at least one
     successful checkout (= has a stripe_customer_id on user_memberships).
     """
+    from payments.base import NoSubscription
+    from payments_api import open_portal
     try:
-        url = await billing.create_portal_session(
-            user_id=user_id,
-            return_url=_safe_return_url(req.return_url),
-        )
+        # Delegates to the payment layer: the member's OWN provider portal.
+        url = await open_portal(user_id, _safe_return_url(req.return_url))
         return PortalSessionResponse(url=url)
-    except ValueError as e:
+    except (ValueError, NoSubscription) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("Stripe portal error: %r", e, exc_info=True)
@@ -2699,11 +2709,26 @@ async def get_my_membership(user_id: str, authed: str = Depends(get_current_user
         period = {"period_start": None, "period_end": None, "source": "calendar_month"}
         used = 0
 
+    # Payment provider the member subscribed with (08_PAYMENT_PROVIDERS):
+    # null when there's nothing to manage.
+    payment_provider = payment_provider_display_name = None
+    try:
+        from payments import registry as _payreg
+        _m = await _payreg.get_member_billing(user_id)
+        if _m is not None and (_m.customer_id or _m.tier != "basic"):
+            payment_provider = _m.payment_provider
+            _ps = (await _payreg.load_snapshot()).get(payment_provider)
+            payment_provider_display_name = _ps.display_name if _ps else payment_provider
+    except Exception as e:
+        logger.warning("payment provider lookup failed for %s: %r", user_id, e)
+
     limits = await get_monthly_limits()
     limit = limits.get(tier, limits["basic"])
     capped = None if math.isinf(limit) else int(limit)
     return {
         "tier": tier,
+        "payment_provider": payment_provider,
+        "payment_provider_display_name": payment_provider_display_name,
         "cheri_ai": {
             "monthly_used": used,
             "monthly_limit": capped,

@@ -212,6 +212,23 @@ async def refresh_price_to_tier_from_db() -> None:
             continue
         TIER_FROM_PRICE_CACHE[pid] = tier
         added += 1
+    # Migration 054: Stripe prices edited in Admin → Payments live in
+    # payment_provider_prices. Missing table (pre-054) → skipped silently.
+    try:
+        prows = await supabase.select(
+            "payment_provider_prices",
+            columns="tier,price_ref",
+            eq={"provider_id": "stripe"},
+        )
+    except Exception:
+        prows = []
+    for r in prows or []:
+        pid = r.get("price_ref")
+        tier = r.get("tier")
+        if not pid or not tier or "REPLACE" in pid or not pid.startswith("price_"):
+            continue
+        TIER_FROM_PRICE_CACHE[pid] = tier
+        added += 1
     logger.info(
         "[billing] price→tier cache: %d entries (%d from DB)",
         len(TIER_FROM_PRICE_CACHE), added,
@@ -255,11 +272,19 @@ async def _upsert_active_membership(
     current_period_end: Optional[datetime] = None,
     cancel_at_period_end: Optional[bool] = None,
     last_invoice_status: Optional[str] = None,
+    payment_provider: str = "stripe",
+    provider_customer_id: Optional[str] = None,
+    provider_subscription_id: Optional[str] = None,
 ) -> None:
     """
     Make `tier` the user's only active membership. Deactivates any previous
     active row first (the partial unique index would otherwise reject the
     insert), then upserts the new one.
+
+    Provider columns (migration 054): `payment_provider` plus
+    provider_customer_id / provider_subscription_id, which mirror the
+    stripe_* ids for Stripe. Until 054 is applied the insert is retried
+    without them (PGRST204 / 42703), so nothing changes for production.
     """
     # Deactivate any other active rows for this user (catches the
     # downgrade/upgrade case where the user already had a different tier).
@@ -298,6 +323,50 @@ async def _upsert_active_membership(
     if last_invoice_status:
         payload["last_invoice_status"] = last_invoice_status
 
+    if payment_provider == "stripe":
+        provider_customer_id = provider_customer_id or stripe_customer_id
+        provider_subscription_id = provider_subscription_id or stripe_subscription_id
+    provider_cols = {"payment_provider": payment_provider or "stripe"}
+    if provider_customer_id:
+        provider_cols["provider_customer_id"] = provider_customer_id
+    if provider_subscription_id:
+        provider_cols["provider_subscription_id"] = provider_subscription_id
+
+    await _insert_membership_row(payload, provider_cols)
+
+
+# Process-wide memo: False once PostgREST said the 054 provider columns don't
+# exist; re-probed after _PROVIDER_COLS_RETRY_S so applying 054 is picked up
+# without a restart.
+_provider_cols_missing_at: Optional[float] = None
+_PROVIDER_COLS_RETRY_S = 600.0
+
+
+def _is_missing_column_error(err: Exception) -> bool:
+    msg = str(err)
+    return "PGRST204" in msg or "42703" in msg or (
+        "column" in msg and ("payment_provider" in msg or "provider_" in msg)
+    )
+
+
+async def _insert_membership_row(payload: dict, provider_cols: dict) -> None:
+    global _provider_cols_missing_at
+    import time as _time
+
+    skip = (
+        _provider_cols_missing_at is not None
+        and _time.monotonic() - _provider_cols_missing_at < _PROVIDER_COLS_RETRY_S
+    )
+    if provider_cols and not skip:
+        try:
+            await supabase.insert("user_memberships", {**payload, **provider_cols})
+            _provider_cols_missing_at = None
+            return
+        except RuntimeError as e:
+            if not _is_missing_column_error(e):
+                raise
+            _provider_cols_missing_at = _time.monotonic()
+            logger.info("[billing] user_memberships provider columns missing (054 not applied); retrying without")
     await supabase.insert("user_memberships", payload)
 
 

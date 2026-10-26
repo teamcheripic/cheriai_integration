@@ -184,6 +184,21 @@ def test_portal_session_ignores_foreign_return_url(monkeypatch):
 
     monkeypatch.setenv("APP_BASE_URL", "https://cheripic.com")
     monkeypatch.setattr(billing, "create_portal_session", portal)
+    # The legacy endpoint now delegates to the payment layer (member's own
+    # provider = Stripe here); keep the test offline.
+    from payments import registry
+    from payments.base import Membership, ProviderSettings
+    from payments.stripe_provider import StripeProvider
+
+    async def member(uid):
+        return Membership(user_id=uid, tier="premium-lite", payment_provider="stripe", customer_id="cus_1")
+
+    async def provider(pid):
+        return StripeProvider(ProviderSettings(id="stripe", display_name="Stripe", enabled=True))
+
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_dummy")
+    monkeypatch.setattr(registry, "get_member_billing", member)
+    monkeypatch.setattr(registry, "get_provider", provider)
     main.app.dependency_overrides[main.get_current_user_id] = lambda: U
     try:
         r = TestClient(main.app).post("/billing/portal-session", json={"user_id": U, "return_url": "https://evil.example"})
