@@ -105,6 +105,7 @@ class StripeProvider(Provider):
                     price_id=price.price_ref or "",
                     success_url=success_url,
                     cancel_url=cancel_url,
+                    extra_metadata=user.metadata or None,
                 )
             except ValueError as e:
                 raise ProviderUnavailable(str(e)) from e
@@ -126,7 +127,7 @@ class StripeProvider(Provider):
                 items=[{"price": price_ref}],
                 payment_behavior="default_incomplete",
                 payment_settings={"save_default_payment_method": "on_subscription"},
-                metadata={"cheripic_user_id": user.id},
+                metadata={**(user.metadata or {}), "cheripic_user_id": user.id},
                 expand=["latest_invoice.confirmation_secret"],
             )
         )

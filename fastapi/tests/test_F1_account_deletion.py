@@ -114,7 +114,8 @@ async def test_confirmation_sent_before_login_removed_and_record_written(billing
     assert row["user_id_hash"] == HASH_A and A not in json.dumps(row)  # hash only, never the id
     assert row["status"] == "completed" and row["completed_at"] and row["requested_at"]
     assert row["stripe_cancelled"] is True and row["confirmation_sent"] is True and row["error"] is None
-    assert row["retained_tables"] == ["user_reports", "user_account_status", "stripe_events", "sent_emails", "sent_push"]
+    assert row["retained_tables"] == ["user_reports", "user_account_status", "stripe_events", "sent_emails", "sent_push",
+                                      "purchase_agreements", "moderation_actions", "preserved_content"]
 
 
 @respx.mock

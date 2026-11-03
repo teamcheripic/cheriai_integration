@@ -3,7 +3,8 @@ Payment-provider endpoints (documents/08_PAYMENT_PROVIDERS.md).
 
 Member
   GET  /billing/config               active provider + how to pay (never cached by clients)
-  POST /billing/checkout             { tier, platform, prefer?, success_url?, cancel_url? }
+  POST /billing/checkout             { tier, platform, prefer?, success_url?, cancel_url?,
+                                       agreement?: {accepted, terms_version, subscription_terms_version} }
   POST /billing/portal               { return_url? } → member's OWN provider
 Provider
   POST /billing/webhook/{provider}   signature-verified per provider
@@ -14,6 +15,21 @@ Admin
 
 Contract errors use one envelope:
   {"detail": {"code": "<code>", "message": "<member-safe text>", "errors"?: [...]}}
+
+Checkout gates (compliance contract "Purchases", in order): age ≥
+min_member_age (under_minimum_age), standing not terminated
+(account_terminated), country_allows(country,'subscriptions')
+(country_unavailable), agreement (agreement_required), no active paid
+membership of the same or a higher tier (409 already_subscribed; a Lite →
+Premium upgrade is sent to the member's billing portal, never a second
+subscription). A purchase_agreements row is then recorded and the agreement
+versions go into the Stripe metadata.
+
+Agreement and the live PWA: the PWA never calls these routes (it uses Stripe
+Payment Links), but older clients might. The agreement is REQUIRED when the
+body carries an `agreement` key or the request sends
+`X-CheriPic-Client: mobile`. Otherwise the checkout is allowed and recorded
+with terms_version='implicit-legacy' (and logged).
 
 Rate limits use the shared `rate_limit()` dependency (not @limiter.limit —
 that breaks body parsing with postponed annotations).
@@ -31,7 +47,8 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from auth import get_current_admin_id, get_current_user_id
+import compliance
+from auth import get_current_admin_id, get_current_user_id, get_member_user_id
 from payments import registry
 from payments.base import (
     CHECKOUT_MODES,
@@ -87,7 +104,7 @@ def _tiers_block() -> Dict[str, Dict[str, bool]]:
 # Member endpoints
 # =============================================================================
 @router.get("/billing/config", tags=["Billing"], dependencies=[Depends(rate_limit("billing_config"))])
-async def billing_config(user_id: str = Depends(get_current_user_id)):
+async def billing_config(user_id: str = Depends(get_member_user_id)):
     res = await registry.resolve_active()
     p = res.provider
     if p is None or not _ready_for_sale(p):
@@ -115,16 +132,130 @@ async def billing_config(user_id: str = Depends(get_current_user_id)):
     }
 
 
+class Agreement(BaseModel):
+    accepted: bool = False
+    terms_version: Optional[str] = None
+    subscription_terms_version: Optional[str] = None
+
+
 class CheckoutBody(BaseModel):
     tier: str
     platform: str = "web"
     prefer: Optional[str] = None  # "redirect" → hosted page even for sdk-mode providers
     success_url: Optional[str] = None
     cancel_url: Optional[str] = None
+    agreement: Optional[Agreement] = None
+
+
+IMPLICIT_LEGACY_TERMS = "implicit-legacy"
+MOBILE_CLIENT_HEADER = "x-cheripic-client"
+
+MSG_UNDER_AGE = "You must be {age} or older to buy a membership."
+MSG_AGE_UNKNOWN = "We couldn't confirm your age. Please contact support@cheripic.com."
+MSG_TERMINATED = "This account has been closed, so it can't buy a membership."
+MSG_COUNTRY = "Memberships aren't available in your country yet."
+MSG_AGREEMENT = "Please accept the Terms and the subscription terms to continue."
+MSG_ALREADY = "You already have this membership (or a higher one). Manage it in Manage subscription."
+
+
+class CheckoutGateError(Exception):
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(code)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+def agreement_required_for(request: Optional[Request], agreement_key_present: bool) -> bool:
+    """Agreement is mandatory when the client sent the key or declares itself
+    a mobile client; legacy callers (no key, no header) get implicit-legacy."""
+    if agreement_key_present:
+        return True
+    hdr = (request.headers.get(MOBILE_CLIENT_HEADER) if request is not None else None) or ""
+    return hdr.strip().lower() == "mobile"
+
+
+async def run_checkout_gates(
+    user_id: str,
+    tier: str,
+    *,
+    agreement: Optional[Agreement],
+    agreement_required: bool,
+) -> Dict[str, Any]:
+    """Compliance gates 1–5 in contract order. Raises CheckoutGateError.
+    Returns {"agreement": {...versions...}, "existing": row|None,
+    "upgrade": bool}; `upgrade` means Lite → Premium (caller must NOT create
+    a second subscription)."""
+    # 1. Profile + minimum age.
+    profile = await compliance.fetch_profile_basics(user_id)
+    min_age = await compliance.min_member_age()
+    age = compliance.age_from_dob((profile or {}).get("date_of_birth"))
+    if profile is None or age is None:
+        raise CheckoutGateError(403, "under_minimum_age", MSG_AGE_UNKNOWN)
+    if age < min_age:
+        raise CheckoutGateError(403, "under_minimum_age", MSG_UNDER_AGE.format(age=min_age))
+    # 2. Standing.
+    if await compliance.member_standing(user_id) == "terminated":
+        raise CheckoutGateError(403, "account_terminated", MSG_TERMINATED)
+    # 3. Country.
+    if not await compliance.country_allows(profile.get("country_of_residence"), "subscriptions"):
+        raise CheckoutGateError(403, "country_unavailable", MSG_COUNTRY)
+    # 4. Agreement.
+    if agreement_required:
+        if (
+            agreement is None
+            or agreement.accepted is not True
+            or not (agreement.terms_version or "").strip()
+            or not (agreement.subscription_terms_version or "").strip()
+        ):
+            raise CheckoutGateError(422, "agreement_required", MSG_AGREEMENT)
+        versions = {
+            "terms_version": agreement.terms_version.strip()[:40],  # type: ignore[union-attr]
+            "subscription_terms_version": agreement.subscription_terms_version.strip()[:40],  # type: ignore[union-attr]
+        }
+    else:
+        logger.info("[payments] checkout without agreement from a legacy client; recording implicit-legacy")
+        versions = {"terms_version": IMPLICIT_LEGACY_TERMS, "subscription_terms_version": IMPLICIT_LEGACY_TERMS}
+    # 5. Duplicate / upgrade.
+    existing = await compliance.active_paid_membership(user_id)
+    upgrade = False
+    if existing:
+        have = compliance.TIER_RANK.get(existing.get("tier") or "basic", 0)
+        want = compliance.TIER_RANK.get(tier, 0)
+        if have >= want:
+            raise CheckoutGateError(409, "already_subscribed", MSG_ALREADY)
+        upgrade = True
+    return {"agreement": versions, "existing": existing, "upgrade": upgrade}
+
+
+async def record_agreement(
+    user_id: str, tier: str, versions: Dict[str, str], *, provider: str, checkout_ref: Optional[str]
+) -> Optional[str]:
+    price = await compliance.tier_price(tier)
+    return await compliance.record_purchase_agreement({
+        "user_id": user_id,
+        "tier": tier,
+        "price": price.get("price"),
+        "currency": price.get("currency"),
+        "billing_interval": price.get("billing_interval"),
+        "terms_version": versions.get("terms_version"),
+        "subscription_terms_version": versions.get("subscription_terms_version"),
+        "channel": "app_store" if provider == "app_store" else "web",
+        "provider": provider,
+        "checkout_ref": checkout_ref,
+    })
+
+
+def _checkout_ref(result: Any) -> Optional[str]:
+    params = getattr(result, "params", None) or {}
+    if params.get("subscription_id"):
+        return str(params["subscription_id"])
+    m = re.search(r"(cs_(?:test|live)_[A-Za-z0-9]+)", getattr(result, "url", None) or "")
+    return m.group(1) if m else None
 
 
 @router.post("/billing/checkout", tags=["Billing"], dependencies=[Depends(rate_limit("billing_checkout"))])
-async def billing_checkout(body: CheckoutBody, user_id: str = Depends(get_current_user_id)):
+async def billing_checkout(body: CheckoutBody, request: Request, user_id: str = Depends(get_current_user_id)):
     if body.tier not in KNOWN_TIERS:
         _err(422, "invalid_tier", "Unknown plan.")
     if not is_purchasable(body.tier):
@@ -132,18 +263,44 @@ async def billing_checkout(body: CheckoutBody, user_id: str = Depends(get_curren
     platform = body.platform if body.platform in PLATFORMS else "web"
     prefer = "redirect" if body.prefer == "redirect" else None
 
-    res = await registry.resolve_active()
-    p = res.provider
-    if p is None:
-        _unavailable()
+    try:
+        gate = await run_checkout_gates(
+            user_id, body.tier, agreement=body.agreement,
+            agreement_required=agreement_required_for(request, "agreement" in body.model_fields_set),
+        )
+    except CheckoutGateError as g:
+        _err(g.status, g.code, g.message)
 
     d_success, d_cancel = default_return_urls(platform)
     success_url = safe_return_url(body.success_url, "/#/profile?checkout=success") if body.success_url else d_success
     cancel_url = safe_return_url(body.cancel_url, "/#/pricing") if body.cancel_url else d_cancel
 
+    if gate["upgrade"]:
+        # Lite → Premium: change the EXISTING subscription in the member's
+        # own billing portal (proration handled there) — never a second one.
+        try:
+            url = await open_portal(user_id, success_url)
+        except Exception as e:
+            logger.warning("[payments] upgrade portal unavailable: %s", type(e).__name__)
+            _err(409, "already_subscribed", "You already have a membership. Change your plan in Manage subscription.")
+        if not _https(url):
+            _err(409, "already_subscribed", "You already have a membership. Change your plan in Manage subscription.")
+        provider_id = (gate["existing"] or {}).get("payment_provider") or "stripe"
+        await record_agreement(user_id, body.tier, gate["agreement"], provider=provider_id, checkout_ref="upgrade_portal")
+        return {"provider": provider_id, "mode": "redirect", "url": url, "upgrade": "portal"}
+
+    res = await registry.resolve_active()
+    p = res.provider
+    if p is None:
+        _unavailable()
+
+    metadata = {
+        "terms_version": gate["agreement"]["terms_version"],
+        "subscription_terms_version": gate["agreement"]["subscription_terms_version"],
+    }
     try:
         result = await p.create_checkout(
-            BillingUser(id=user_id), body.tier, platform,
+            BillingUser(id=user_id, metadata=metadata), body.tier, platform,
             success_url=success_url, cancel_url=cancel_url, prefer=prefer,
         )
     except ProviderError as e:
@@ -159,6 +316,7 @@ async def billing_checkout(body: CheckoutBody, user_id: str = Depends(get_curren
             _unavailable()
     elif prefer == "redirect" or result.mode != "sdk":
         _unavailable()
+    await record_agreement(user_id, body.tier, gate["agreement"], provider=p.id, checkout_ref=_checkout_ref(result))
     return result.to_response(p.id)
 
 
@@ -179,6 +337,7 @@ async def open_portal(user_id: str, return_url: Optional[str]) -> str:
     return await p.create_portal(BillingUser(id=user_id), m, return_url=safe_return_url(return_url))
 
 
+# Not standing-gated: a terminated member must still be able to cancel.
 @router.post("/billing/portal", tags=["Billing"], dependencies=[Depends(rate_limit("billing_checkout"))])
 async def billing_portal(body: Optional[PortalBody] = None, user_id: str = Depends(get_current_user_id)):
     try:
@@ -196,7 +355,9 @@ async def billing_portal(body: Optional[PortalBody] = None, user_id: str = Depen
     return {"url": url}
 
 
-async def legacy_checkout_session(user_id: str, price_id: str, success_url: str, cancel_url: str) -> str:
+async def legacy_checkout_session(
+    user_id: str, price_id: str, success_url: str, cancel_url: str, metadata: Optional[Dict[str, str]] = None
+) -> str:
     """/billing/create-checkout-session (contract unchanged: Stripe price id
     in, redirect url out). Stripe active → the original Checkout Session
     path; another provider active → the tier behind that price via the
@@ -207,14 +368,16 @@ async def legacy_checkout_session(user_id: str, price_id: str, success_url: str,
     p = res.provider
     if p is None or p.id == "stripe":
         return await billing.create_checkout_session(
-            user_id=user_id, price_id=price_id, success_url=success_url, cancel_url=cancel_url
+            user_id=user_id, price_id=price_id, success_url=success_url, cancel_url=cancel_url,
+            extra_metadata=metadata,
         )
     await billing.refresh_price_to_tier_from_db()
     tier = billing._tier_for_price(price_id)
     if not tier or not is_purchasable(tier):
         raise ValueError("price_id is not a purchasable plan")
     result = await p.create_checkout(
-        BillingUser(id=user_id), tier, "web", success_url=success_url, cancel_url=cancel_url, prefer="redirect"
+        BillingUser(id=user_id, metadata=dict(metadata or {})), tier, "web",
+        success_url=success_url, cancel_url=cancel_url, prefer="redirect",
     )
     if result.mode != "redirect" or not _https(result.url):
         raise ProviderError("active provider has no hosted checkout")

@@ -61,7 +61,8 @@ def env(monkeypatch):
     state = {
         "session": {"id": "s1", "user_id": U, "is_completed": False},
         "responses": [],
-        "profile": {"user_id": U, "bio": GOOD_BIO, "gender": "female", "verification_final_status": "verified"},
+        "profile": {"user_id": U, "bio": GOOD_BIO, "gender": "female", "verification_final_status": "verified",
+                    "date_of_birth": "1990-05-01", "country_of_residence": "AE"},
         "score_row": {"total_score": 86, "assessment_count": 1},
         "official": [],
         "session_patches": [], "score_upserts": [], "bio_patches": [], "emails": [],

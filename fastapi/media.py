@@ -45,7 +45,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status, Request
 from ratelimit import rate_limit
 from pydantic import BaseModel, Field
 
-from auth import get_current_admin_id, get_current_user_id
+from auth import get_current_admin_id, get_current_user_id, get_member_user_id  # noqa: F401
 
 logger = logging.getLogger("cheripic.media")
 
@@ -330,13 +330,13 @@ async def create_blur_derivative(client: httpx.AsyncClient, user_id: str, source
 
 
 @router.post("/media/blurred", response_model=BlurResponse, tags=["Media"], dependencies=[Depends(rate_limit("media"))])
-async def media_blurred(req: BlurRequest, user_id: str = Depends(get_current_user_id)) -> BlurResponse:
+async def media_blurred(req: BlurRequest, user_id: str = Depends(get_member_user_id)) -> BlurResponse:
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
         return await create_blur_derivative(client, user_id, req.source_url)
 
 
 @router.get("/media/photos/{target_id}", tags=["Media"], dependencies=[Depends(rate_limit("media"))])
-async def media_photos(target_id: str, response: Response, user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
+async def media_photos(target_id: str, response: Response, user_id: str = Depends(get_member_user_id)) -> dict[str, Any]:
     _validate_ids([target_id])
     response.headers["Cache-Control"] = "no-store"
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
@@ -356,7 +356,7 @@ class BatchRequest(BaseModel):
 
 
 @router.post("/media/photos/batch", tags=["Media"], dependencies=[Depends(rate_limit("media"))])
-async def media_photos_batch(req: BatchRequest, response: Response, user_id: str = Depends(get_current_user_id)) -> dict[str, Any]:
+async def media_photos_batch(req: BatchRequest, response: Response, user_id: str = Depends(get_member_user_id)) -> dict[str, Any]:
     ids = _validate_ids(req.user_ids)
     response.headers["Cache-Control"] = "no-store"
     if not ids:

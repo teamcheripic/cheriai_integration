@@ -60,6 +60,10 @@ RATE_LIMITS = {
     "billing_checkout": _rl("BILLING_CHECKOUT", "10/minute"),
     "billing_config": _rl("BILLING_CONFIG", "60/minute"),
     "admin_payments": _rl("ADMIN_PAYMENTS", "30/minute"),
+    # Compliance endpoints (compliance_api.py)
+    "ai_report": _rl("AI_REPORT", "10/hour"),
+    "me_export": _rl("ME_EXPORT", "3/day"),
+    "admin_moderation": _rl("ADMIN_MODERATION", "60/minute"),
 }
 
 limiter = Limiter(

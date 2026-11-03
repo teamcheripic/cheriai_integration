@@ -255,6 +255,12 @@ _DELETE_TARGETS: list[tuple[str, str]] = [
     ("chat_users", "user_id"),
     ("claimed_offers", "user_id"),
     ("analytics_events", "user_id"),
+    # Compliance tables (056/057, NOT APPLIED — a missing table answers 404,
+    # which is tolerated). Legal holds block deletion entirely, so appeals
+    # are only ever deleted when there is no hold.
+    ("member_consents", "user_id"),
+    ("dob_change_requests", "user_id"),
+    ("appeals", "user_id"),
     ("blocked_users", "blocker_id"),
     ("blocked_users", "blocked_id"),
     ("user_relationship_history", "user_a_id"),
@@ -269,6 +275,9 @@ _DELETE_TARGETS: list[tuple[str, str]] = [
 # (financial and delivery records). user_devices cascades from auth.users.
 RETAINED_TABLES: list[str] = [
     "user_reports", "user_account_status", "stripe_events", "sent_emails", "sent_push",
+    # Compliance (057/058): billing agreement record, moderation log and
+    # preserved evidence are kept on deletion.
+    "purchase_agreements", "moderation_actions", "preserved_content",
 ]
 
 
@@ -279,7 +288,9 @@ def _stripe_sub_already_gone(err: Exception) -> bool:
     return code == "resource_missing" or "no such subscription" in msg or "canceled subscription" in msg
 
 
-async def _cancel_stripe_subscription(client: httpx.AsyncClient, user_id: str) -> int:
+async def _cancel_stripe_subscription(
+    client: httpx.AsyncClient, user_id: str, customers_out: Optional[set[str]] = None
+) -> int:
     """
     Cancel direct (Stripe) billing BEFORE any data is removed. If Stripe
     can't be reached we stop here and the job stays retryable — deleting
@@ -288,13 +299,16 @@ async def _cancel_stripe_subscription(client: httpx.AsyncClient, user_id: str) -
     """
     r = await client.get(
         f"{_REST}/user_memberships",
-        params={"select": "stripe_subscription_id", "user_id": f"eq.{user_id}"},
+        params={"select": "stripe_subscription_id,stripe_customer_id", "user_id": f"eq.{user_id}"},
         headers=_HEADERS,
     )
     if r.status_code >= 300:
         logger.error("[delete-account] membership lookup failed [%s]", r.status_code)
         raise MemberActionError("billing_lookup_failed")
-    subs = {row.get("stripe_subscription_id") for row in (r.json() or [])}
+    rows = r.json() or []
+    if customers_out is not None:
+        customers_out.update(row["stripe_customer_id"] for row in rows if row.get("stripe_customer_id"))
+    subs = {row.get("stripe_subscription_id") for row in rows}
     subs.discard(None)
     subs.discard("")
     cancelled = 0
@@ -438,6 +452,78 @@ async def _record_deletion(record: dict[str, Any]) -> bool:
     return False
 
 
+async def _delete_stripe_customers(customer_ids: set[str]) -> int:
+    """After the subscriptions are cancelled, delete the Stripe customer(s)
+    (removes stored payment methods at Stripe). Local billing records are
+    kept. Soft: a failure is logged and never blocks the deletion."""
+    deleted = 0
+    for cust in sorted(c for c in customer_ids if c):
+        try:
+            import billing
+
+            stripe = billing._get_stripe()
+            await asyncio.to_thread(stripe.Customer.delete, cust)
+            deleted += 1
+        except Exception as e:
+            if getattr(e, "code", None) == "resource_missing" or "no such customer" in str(e).lower():
+                continue
+            logger.warning("[delete-account] stripe customer delete failed: %s", type(e).__name__)
+    return deleted
+
+
+async def _delete_onesignal_user(user_id: str) -> bool:
+    """Delete the OneSignal user addressed by external_id = our user id.
+    Skipped (False) when ONESIGNAL_APP_ID / ONESIGNAL_REST_API_KEY aren't set."""
+    import os
+    from urllib.parse import quote
+
+    app_id = (os.getenv("ONESIGNAL_APP_ID") or "").strip()
+    key = (os.getenv("ONESIGNAL_REST_API_KEY") or "").strip()
+    if not app_id or not key:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.delete(
+                f"https://api.onesignal.com/apps/{quote(app_id, safe='')}/users/by/external_id/{quote(user_id, safe='')}",
+                headers={"Authorization": f"Key {key}", "Accept": "application/json"},
+            )
+        if r.status_code < 300 or r.status_code == 404:
+            return True
+        logger.warning("[delete-account] onesignal delete failed [%s]", r.status_code)
+    except Exception as e:
+        logger.warning("[delete-account] onesignal delete failed: %s", type(e).__name__)
+    return False
+
+
+async def _preserve_member_messages(client: httpx.AsyncClient, user_id: str, match_ids: list[str]) -> int:
+    """Before any message delete: if the member has an open report (by or
+    about them), copy their Red Room threads + sent legacy messages to
+    preserved_content. Never raises."""
+    import compliance
+
+    try:
+        if not await compliance.has_open_report(user_id):
+            return 0
+        stored = 0
+        if match_ids:
+            stored += await compliance.preserve_match_messages(
+                match_ids, [user_id], reason="account_deletion_open_report", subject_user_id=user_id)
+        m = await client.get(
+            f"{_REST}/match_messages",
+            params={"select": "id,match_id,sender_id,content,created_at", "sender_id": f"eq.{user_id}"},
+            headers=_HEADERS,
+        )
+        if m.status_code < 300:
+            seen = set(match_ids)
+            rows = [r for r in (m.json() or []) if r.get("match_id") not in seen]
+            stored += await compliance.preserve_rows(
+                "match_messages", rows, subject_user_id=user_id, reason="account_deletion_open_report")
+        return stored
+    except Exception as e:
+        logger.error("[delete-account] evidence preservation failed: %s", type(e).__name__)
+        return 0
+
+
 async def delete_account(user_id: str) -> dict[str, Any]:
     """
     Idempotent and retryable: every step tolerates rows already being gone,
@@ -469,12 +555,30 @@ async def delete_account(user_id: str) -> dict[str, Any]:
 
 
 async def _delete_account_steps(user_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    import compliance
+
     counts: dict[str, int] = {}
+    # Legal hold (057): nothing is deleted; support contacts the member.
+    if await compliance.has_legal_hold(user_id):
+        logger.warning("[delete-account] refused: active legal hold")
+        raise MemberActionError("legal_hold")
     async with httpx.AsyncClient(timeout=60.0) as client:
         # Billing first (nothing deleted if Stripe can't be reached).
-        record["stripe_cancelled"] = (await _cancel_stripe_subscription(client, user_id)) > 0
+        customers: set[str] = set()
+        record["stripe_cancelled"] = (await _cancel_stripe_subscription(client, user_id, customers)) > 0
+        # Not stored on the 051 record (fixed columns) — counted in the log line.
+        counts["stripe_customers_deleted"] = await _delete_stripe_customers(customers)
         # Address for the confirmation, captured while the profile exists.
         recipient = await _deletion_recipient(client, user_id)
+
+        # Evidence first: copy messages to preserved_content when there's an
+        # open report on or by the member (057; table missing → logged).
+        all_match_ids: list[str] = []
+        for col in ("user_a_id", "user_b_id"):
+            pm = await client.get(f"{_REST}/matches", params={"select": "id", col: f"eq.{user_id}"}, headers=_HEADERS)
+            if pm.status_code < 300:
+                all_match_ids.extend(row["id"] for row in (pm.json() or []) if row.get("id"))
+        counts["preserved_messages"] = await _preserve_member_messages(client, user_id, all_match_ids)
 
         # Close every pair the member is in first, so partners' Red Rooms
         # disappear and photo access ends immediately.
@@ -525,6 +629,9 @@ async def _delete_account_steps(user_id: str, record: dict[str, Any]) -> dict[st
             )
 
         counts["storage_objects"] = await _delete_storage(client, user_id)
+
+        # Push identity at OneSignal (soft; skipped when not configured).
+        counts["onesignal_user_deleted"] = int(await _delete_onesignal_user(user_id))
 
         # Confirmation goes out while the login still exists (soft failure).
         record["confirmation_sent"] = await _send_deletion_confirmation(recipient)

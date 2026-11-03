@@ -31,7 +31,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from auth import get_current_user_id, get_current_admin_id, require_self
+from auth import get_current_user_id, get_current_admin_id, require_self, get_member_user_id, get_contact_user_id
+import compliance
 from supabase_client import supabase, SUPABASE_URL, SUPABASE_KEY
 import llm_client
 from llm_client import send_to_llm, send_to_llm_with_usage, build_usage_ledger_row
@@ -202,6 +203,11 @@ class ChatResponse(BaseModel):
     # membership.ts reads the monthly_* fields.
     daily_used: int
     daily_limit: Optional[int] = None
+    # chat_history ids of the stored assistant bubble(s), so the app can
+    # report a specific CheriAI reply (POST /ai/report). Additive; None when
+    # the history write failed.
+    assistant_message_id: Optional[str] = None
+    follow_up_message_id: Optional[str] = None
     # NOTE: we intentionally do NOT echo the user profile (email, phone, KYC
     # URLs, bio, etc.) on every reply. The frontend already has that.
 
@@ -260,14 +266,20 @@ class ConversationHistoryResponse(BaseModel):
     created_at: str
 
 
+PROMPT_PROFILE_COLUMNS = "user_id,nick_name,full_name,gender,date_of_birth,nationality,country_of_residence,bio"
+
+
 async def fetch_user_profile(user_id: str) -> Optional[dict]:
     """
     Look up a user_profiles row by the auth UID stored in the `user_id` column.
     Returns None if not found — chat still proceeds with a generic prompt.
     """
     try:
+        # Only the columns the prompt builder uses — never kyc_*, contact
+        # details, verification images or anything payment-related.
         rows = await supabase.select(
             "user_profiles",
+            columns=PROMPT_PROFILE_COLUMNS,
             eq={"user_id": user_id},
             limit=1,
         )
@@ -278,8 +290,9 @@ async def fetch_user_profile(user_id: str) -> Optional[dict]:
 
 
 def _schedule_stripe_reconcile(scheduler) -> bool:
-    """H13.17 · daily Stripe ↔ user_memberships reconciliation, opt-in via
-    ENABLE_STRIPE_RECONCILE (crontab override STRIPE_RECONCILE_CRON, UTC)."""
+    """H13.17 · daily Stripe ↔ user_memberships reconciliation, on by default
+    (ENABLE_STRIPE_RECONCILE=false turns it off; crontab override
+    STRIPE_RECONCILE_CRON, UTC)."""
     if not billing.reconcile_enabled():
         return False
     from apscheduler.triggers.cron import CronTrigger
@@ -400,6 +413,12 @@ async def lifespan(app: FastAPI):
             coalesce=True,
         )
         _schedule_stripe_reconcile(scheduler)
+        try:
+            import kyc_retention
+
+            kyc_retention.schedule(scheduler)  # ENABLE_KYC_RETENTION, default on
+        except Exception as e:
+            logger.error("Could not arm the KYC retention job: %r", e)
         scheduler.start()
         app.state.scheduler = scheduler
         logger.info("Cron supervisor running (15-min reconcile against app_config).")
@@ -453,7 +472,7 @@ async def _rate_limit_exceeded(request: Request, exc: RateLimitExceeded):
 
 
 # --- Feature routers (added by integration) ---
-for _mod in ("media", "cheripass", "official", "readiness", "payments_api"):
+for _mod in ("media", "cheripass", "official", "readiness", "payments_api", "compliance_api"):
     try:
         app.include_router(__import__(_mod).router)
     except ModuleNotFoundError:
@@ -599,7 +618,7 @@ SELF_TRIGGERABLE_TEMPLATES = frozenset({"welcome_free", "verification_submitted"
 async def trigger_self_email(
     request: Request,
     req: SelfTriggerEmailRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_member_user_id),
 ):
     """
     Fire a transactional email TO THE AUTHED USER themselves. For
@@ -688,7 +707,7 @@ class ReportSubmittedRequest(BaseModel):
 async def safety_report_submitted(
     request: Request,
     req: ReportSubmittedRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_member_user_id),
 ):
     """
     Private in-app receipt for the REPORTER only (handoff §14 "Report
@@ -1110,7 +1129,7 @@ class NotifyInterestReceivedRequest(BaseModel):
 async def matching_notify_interest_received(
     request: Request,
     req: NotifyInterestReceivedRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_contact_user_id),
 ):
     """
     Fire-and-forget from the frontend after `sendMatchRequestSimple`.
@@ -1271,7 +1290,7 @@ class NotifyPartnerProposalRequest(BaseModel):
 async def matching_notify_partner_proposal(
     request: Request,
     req: NotifyPartnerProposalRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_contact_user_id),
 ):
     """
     Fire-and-forget from acceptPartnership() when the caller is the
@@ -1425,7 +1444,7 @@ class NotifyUnmatchRequest(BaseModel):
 async def matching_notify_unmatch(
     request: Request,
     req: NotifyUnmatchRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_member_user_id),
 ):
     """
     Fire-and-forget from unmatchUser() after the DB updates land.
@@ -1585,7 +1604,7 @@ class NotifyInterestRespondedRequest(BaseModel):
 async def matching_notify_interest_responded(
     request: Request,
     req: NotifyInterestRespondedRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_contact_user_id),
 ):
     """
     Fire-and-forget from respondToMatchRequest() after the DB update
@@ -1695,7 +1714,7 @@ class NotifyProposalDeclinedRequest(BaseModel):
 async def matching_notify_partner_proposal_declined(
     request: Request,
     req: NotifyProposalDeclinedRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_member_user_id),
 ):
     """
     Fire-and-forget when a user unmatches a connection where the OTHER
@@ -1763,7 +1782,7 @@ class NotifyUnreadMessageRequest(BaseModel):
 async def chat_notify_unread_message(
     request: Request,
     req: NotifyUnreadMessageRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_contact_user_id),
 ):
     """
     Fire-and-forget from sendMatchMessage() after insert. Debounced
@@ -1838,7 +1857,7 @@ class NotifyAssessmentCompletedRequest(BaseModel):
 async def assessment_notify_completed(
     request: Request,
     req: NotifyAssessmentCompletedRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_member_user_id),
 ):
     """
     Fire-and-forget from the CheriAI assessment completion UI. Sends
@@ -1882,7 +1901,7 @@ async def assessment_notify_completed(
 @app.post("/matching/finalize-partnership", tags=["Matching"])
 async def matching_finalize_partnership(
     req: FinalizePartnershipRequest,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_member_user_id),
 ):
     """
     Explicit partnership finalizer — no hidden DB triggers, no OF-clause
@@ -1925,7 +1944,7 @@ async def matching_finalize_partnership(
 async def matching_withdraw_interest(
     request: Request,
     req: WithdrawInterestRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_member_user_id),
 ):
     """
     11.2B.1 · Withdraw a pending interest the caller sent. Conditional on the
@@ -1953,6 +1972,11 @@ async def account_delete(request: Request, caller_user_id: str = Depends(get_cur
         result = await delete_account(caller_user_id)
     except MemberActionError as e:
         code = str(e)
+        if code == "legal_hold":
+            raise HTTPException(status_code=409, detail={
+                "code": "legal_hold",
+                "message": "We can't delete this account right now. Our support team will contact you.",
+            })
         # Billing/storage/upstream failures are retryable: nothing is
         # reported as deleted and the login still exists for the retry.
         status_code = 502 if code in ("billing_cancel_failed", "billing_lookup_failed") else 500
@@ -2149,13 +2173,79 @@ async def admin_wipe_dedup_queue(
     return {"ok": True, "deleted": deleted}
 
 
+AI_CONSENT_REQUIRED = {
+    "code": "ai_consent_required",
+    "message": "CheriAI needs your permission to send your messages to OpenAI for processing. "
+               "You can turn this on in Settings > Privacy.",
+}
+
+
+async def _require_ai_consent(user_id: str) -> None:
+    """403 ai_consent_required when 056's ai_consent_at is NULL. A missing
+    column (056 not applied) counts as consented. Unknown (upstream error)
+    → 503 so nothing is sent to OpenAI without a confirmed consent."""
+    consent = await compliance.has_ai_consent(user_id)
+    if consent is None:
+        raise HTTPException(status_code=503, detail="CheriAI couldn't reply just now. Please try again.")
+    if not consent:
+        raise HTTPException(status_code=403, detail=AI_CONSENT_REQUIRED)
+
+
+async def _static_chat_reply(
+    user_id: str,
+    req: "ChatRequest",
+    reply_text: str,
+    follow_up: Optional[str],
+    background_tasks: BackgroundTasks,
+) -> "ChatResponse":
+    """A reply that never touches the LLM (canned pleasantry, crisis router,
+    moderation refusal): saved to chat_history, no quota consumed, no memory
+    distillation; usage numbers are still returned for the usage strip."""
+    conversation_id = req.conversation_id or f"conv_{user_id}_{int(datetime.now().timestamp())}"
+    assistant_id = follow_up_id = None
+    try:
+        await save_conversation_message(user_id, conversation_id, "user", req.message, req.stage)
+        assistant_id = await save_conversation_message(user_id, conversation_id, "assistant", reply_text, req.stage)
+        if follow_up:
+            follow_up_id = await save_conversation_message(user_id, conversation_id, "assistant", follow_up, req.stage)
+    except Exception as e:
+        logger.error(f"[static chat_history] insert FAILED for user {user_id}: {e}")
+
+    tier = await billing.get_membership_tier(user_id)
+    limits = await get_monthly_limits()
+    limit = limits.get(tier, limits["basic"])
+    period = await billing.get_quota_period(user_id)
+    used = await billing.get_period_usage(user_id, period["period_start"])
+    capped = None if math.isinf(limit) else int(limit)
+    background_tasks.add_task(
+        _record_ai_usage,
+        build_usage_ledger_row(user_id=user_id, purpose="chat", tier=tier, model="", usage=None, canned=True),
+    )
+    return ChatResponse(
+        reply=reply_text,
+        follow_up=follow_up,
+        conversation_id=conversation_id,
+        stage=req.stage,
+        timestamp=datetime.now().isoformat(),
+        tier=tier,
+        monthly_used=used,
+        monthly_limit=capped,
+        period_start=period["period_start"],
+        period_end=period["period_end"],
+        daily_used=used,
+        daily_limit=capped,
+        assistant_message_id=assistant_id,
+        follow_up_message_id=follow_up_id,
+    )
+
+
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"])
 @limiter.limit(RATE_LIMITS["chat"])
 async def chat(
     request: Request,
     req: ChatRequest,
     background_tasks: BackgroundTasks,
-    user_id: str = Depends(get_current_user_id),
+    user_id: str = Depends(get_member_user_id),
 ):
     # user_id comes from the VERIFIED token — never from the request body.
     logger.info(f"Chat | User: {user_id} | Stage: {req.stage} | Length: {len(req.message)}")
@@ -2164,6 +2254,21 @@ async def chat(
             status_code=422,
             detail=CHAT_TOO_LONG_DETAIL,
         )
+
+    # ---- Crisis router (always on, never calls the LLM) --------------------
+    # Runs BEFORE the consent gate on purpose: the fixed reply sends nothing
+    # to OpenAI, and a member in crisis must never get a consent screen
+    # instead of emergency guidance.
+    if compliance.is_crisis(req.message):
+        logger.info("[ai-safety] crisis router matched for user=%s", user_id)
+        await compliance.log_ai_safety_event(
+            user_id, "crisis", action="crisis_reply", conversation_id=req.conversation_id)
+        return await _static_chat_reply(user_id, req, compliance.CRISIS_REPLY, None, background_tasks)
+
+    # ---- CheriAI consent (056 ai_consent_at; column missing → consented) ----
+    # Gates every other reply, canned ones included (contract: simpler to
+    # reason about — nothing is processed for a member who hasn't consented).
+    await _require_ai_consent(user_id)
 
     # ---- Cheap intent router ------------------------------------------------
     # If the message is an obvious pleasantry (hi / thanks / how are you /
@@ -2177,44 +2282,16 @@ async def chat(
         user_data = await fetch_user_profile(user_id) or {}
         display_name = user_data.get("nick_name") or user_data.get("full_name")
         reply_text, follow_up = respond_canned(canned_category, name=display_name)
-        conversation_id = req.conversation_id or f"conv_{user_id}_{int(datetime.now().timestamp())}"
+        return await _static_chat_reply(user_id, req, reply_text, follow_up, background_tasks)
 
-        try:
-            await save_conversation_message(user_id, conversation_id, "user", req.message, req.stage)
-            await save_conversation_message(user_id, conversation_id, "assistant", reply_text, req.stage)
-            if follow_up:
-                await save_conversation_message(user_id, conversation_id, "assistant", follow_up, req.stage)
-        except Exception as e:
-            logger.error(f"[canned chat_history] insert FAILED for user {user_id}: {e}")
-
-        # Tier / period is still surfaced so the frontend usage strip
-        # renders the same numbers as it would after an LLM reply. Cheap
-        # queries — no OpenAI involvement.
-        tier = await billing.get_membership_tier(user_id)
-        limits = await get_monthly_limits()
-        limit = limits.get(tier, limits["basic"])
-        period = await billing.get_quota_period(user_id)
-        used = await billing.get_period_usage(user_id, period["period_start"])
-        capped = None if math.isinf(limit) else int(limit)
-        background_tasks.add_task(
-            _record_ai_usage,
-            build_usage_ledger_row(user_id=user_id, purpose="chat", tier=tier, model="", usage=None, canned=True),
-        )
-
-        return ChatResponse(
-            reply=reply_text,
-            follow_up=follow_up,
-            conversation_id=conversation_id,
-            stage=req.stage,
-            timestamp=datetime.now().isoformat(),
-            tier=tier,
-            monthly_used=used,
-            monthly_limit=capped,
-            period_start=period["period_start"],
-            period_end=period["period_end"],
-            daily_used=used,
-            daily_limit=capped,
-        )
+    # ---- Input moderation (OpenAI omni-moderation-latest; fails open) ------
+    mod_in = await compliance.moderate(req.message)
+    if mod_in.get("flagged"):
+        await compliance.log_ai_safety_event(
+            user_id, "input", action="crisis_reply" if mod_in.get("self_harm") else "refused",
+            categories=mod_in.get("categories"), conversation_id=req.conversation_id)
+        safe = compliance.CRISIS_REPLY if mod_in.get("self_harm") else compliance.SAFE_INPUT_REPLY
+        return await _static_chat_reply(user_id, req, safe, None, background_tasks)
 
     # ---- Membership rate limit (BEFORE the LLM call so we don't burn $$) ----
     tier = await billing.get_membership_tier(user_id)
@@ -2313,6 +2390,16 @@ async def chat(
             # Model returned JSON without reply text — don't save or show it.
             logger.warning("[chat] empty parsed reply for user=%s", user_id)
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="CheriAI couldn't reply just now. Please try again.")
+
+        # Output moderation: a flagged reply is replaced with a safe fallback.
+        output_flagged = False
+        mod_out = await compliance.moderate(f"{reply_text}\n{follow_up}" if follow_up else reply_text)
+        if mod_out.get("flagged"):
+            output_flagged = True
+            await compliance.log_ai_safety_event(
+                user_id, "output", action="replaced", categories=mod_out.get("categories"),
+                conversation_id=req.conversation_id)
+            reply_text, follow_up = compliance.SAFE_OUTPUT_FALLBACK, None
         logger.info(
             "Parsed reply: main=%d chars, follow_up=%s",
             len(reply_text),
@@ -2321,12 +2408,13 @@ async def chat(
 
         conversation_id = req.conversation_id or f"conv_{user_id}_{int(datetime.now().timestamp())}"
 
+        assistant_id = follow_up_id = None
         try:
             await save_conversation_message(user_id, conversation_id, "user", req.message, req.stage)
-            await save_conversation_message(user_id, conversation_id, "assistant", reply_text, req.stage)
+            assistant_id = await save_conversation_message(user_id, conversation_id, "assistant", reply_text, req.stage)
             saved_count = 2
             if follow_up:
-                await save_conversation_message(user_id, conversation_id, "assistant", follow_up, req.stage)
+                follow_up_id = await save_conversation_message(user_id, conversation_id, "assistant", follow_up, req.stage)
                 saved_count = 3
             logger.info(f"Saved {saved_count} messages to chat_history for conversation {conversation_id}")
         except Exception as e:
@@ -2344,9 +2432,10 @@ async def chat(
         # runs each task to completion after the HTTP response is flushed,
         # so we get reliable execution + any exception surfaces in the logs.
         combined_for_memory = f"{reply_text}\n{follow_up}" if follow_up else reply_text
-        background_tasks.add_task(
-            update_memory_async, user_id, req.message, combined_for_memory
-        )
+        if not output_flagged:
+            background_tasks.add_task(
+                update_memory_async, user_id, req.message, combined_for_memory
+            )
         logger.info(
             f"[memory] scheduled distill task for user={user_id} "
             f"(background_tasks queue = {len(background_tasks.tasks)})"
@@ -2373,6 +2462,8 @@ async def chat(
             period_end=period["period_end"],
             daily_used=new_used,
             daily_limit=None if math.isinf(limit) else int(limit),
+            assistant_message_id=assistant_id,
+            follow_up_message_id=follow_up_id,
         )
 
     except HTTPException:
@@ -2413,12 +2504,15 @@ class SeedMemoryResponse(BaseModel):
     ok: bool
     summary: str
     insights_count: int
+    # 'no_consent' when CheriAI data sharing isn't granted (056) — the
+    # fire-and-forget signup call stays quiet instead of getting a 403.
+    skipped: Optional[str] = None
 
 
-@app.post("/memory/seed", response_model=SeedMemoryResponse, tags=["Memory"])
+@app.post("/memory/seed", response_model=SeedMemoryResponse, tags=["Memory"], response_model_exclude_none=True)
 async def seed_memory(
     req: SeedMemoryRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_member_user_id),
 ):
     """
     Distill the caller's profile + bio fields into an initial Cheri memory
@@ -2430,6 +2524,8 @@ async def seed_memory(
     frontend can call it fire-and-forget without breaking registration.
     """
     require_self(caller_user_id, req.user_id)
+    if await compliance.has_ai_consent(req.user_id) is not True:
+        return SeedMemoryResponse(ok=False, summary="", insights_count=0, skipped="no_consent")
     result = await seed_memory_from_profile(req.user_id)
     if not result:
         # No profile row yet, or LLM/JSON parse failure. Signal to the
@@ -2448,12 +2544,15 @@ async def seed_memory(
 # admin panel's "Reseed from profile" button in the AI Memory viewer,
 # typically to fix rows that were left empty by a first-time seed run
 # with the AI backend down or OPENAI_API_KEY unset.
-@app.post("/memory/admin-reseed", response_model=SeedMemoryResponse, tags=["Memory"])
+@app.post("/memory/admin-reseed", response_model=SeedMemoryResponse, tags=["Memory"], response_model_exclude_none=True)
 async def admin_reseed_memory(
     req: SeedMemoryRequest,
     admin_user_id: str = Depends(get_current_admin_id),
 ):
     logger.info(f"[memory-admin-reseed] admin={admin_user_id} target={req.user_id}")
+    if await compliance.has_ai_consent(req.user_id) is not True:
+        # The member hasn't consented to OpenAI processing — admins can't override it.
+        return SeedMemoryResponse(ok=False, summary="", insights_count=0, skipped="no_consent")
     result = await seed_memory_from_profile(req.user_id)
     if not result:
         return SeedMemoryResponse(ok=False, summary="", insights_count=0)
@@ -2489,7 +2588,7 @@ class VerifyFaceResponse(BaseModel):
 
 @app.post("/kyc/verify-face", response_model=VerifyFaceResponse, tags=["KYC"])
 @limiter.limit(RATE_LIMITS["verify_face"])
-async def verify_face(request: Request, req: VerifyFaceRequest, user_id: str = Depends(get_current_user_id)):
+async def verify_face(request: Request, req: VerifyFaceRequest, user_id: str = Depends(get_member_user_id)):
     """
     Compare a user's live selfie against the face on their ID-proof image
     and, if the similarity is >= threshold, mark them verified.
@@ -2588,11 +2687,18 @@ async def verify_face(request: Request, req: VerifyFaceRequest, user_id: str = D
     )
 
 
+class CreateCheckoutAgreement(BaseModel):
+    accepted: bool = False
+    terms_version: Optional[str] = None
+    subscription_terms_version: Optional[str] = None
+
+
 class CreateCheckoutRequest(BaseModel):
     user_id: str
     price_id: str
     success_url: str
     cancel_url: str
+    agreement: Optional[CreateCheckoutAgreement] = None
 
     @validator('user_id', 'price_id', 'success_url', 'cancel_url')
     def _not_empty(cls, v):
@@ -2607,9 +2713,31 @@ class CreateCheckoutResponse(BaseModel):
 
 @app.post("/billing/create-checkout-session", response_model=CreateCheckoutResponse, tags=["Billing"])
 async def create_checkout_session(
-    req: CreateCheckoutRequest, user_id: str = Depends(get_current_user_id)
+    req: CreateCheckoutRequest, request: Request, user_id: str = Depends(get_member_user_id)
 ):
-    """Returns the Stripe-hosted checkout URL the frontend should redirect to."""
+    """Returns the Stripe-hosted checkout URL the frontend should redirect to.
+
+    Same compliance gates as /billing/checkout. This legacy route keeps its
+    string-`detail` convention: errors are `{"detail": "<code>"}` (e.g.
+    "under_minimum_age", "already_subscribed"). A Lite → Premium upgrade is
+    refused with 409 already_subscribed here (use /billing/checkout or the
+    portal) so a second subscription is never created."""
+    from payments_api import (
+        Agreement, CheckoutGateError, agreement_required_for, record_agreement, run_checkout_gates,
+    )
+
+    await billing.refresh_price_to_tier_from_db()
+    tier = billing._tier_for_price(req.price_id) or "premium-lite"
+    try:
+        gate = await run_checkout_gates(
+            user_id, tier,
+            agreement=Agreement(**req.agreement.model_dump()) if req.agreement else None,
+            agreement_required=agreement_required_for(request, "agreement" in req.model_fields_set),
+        )
+    except CheckoutGateError as g:
+        raise HTTPException(status_code=g.status, detail=g.code)
+    if gate["upgrade"]:
+        raise HTTPException(status_code=409, detail="already_subscribed")
     try:
         # Delegates to the payment layer: Stripe active → the original
         # Checkout Session path; another provider active → its hosted page.
@@ -2619,7 +2747,9 @@ async def create_checkout_session(
             price_id=req.price_id,
             success_url=_safe_return_url(req.success_url, "/#/profile?checkout=success"),
             cancel_url=_safe_return_url(req.cancel_url, "/#/pricing"),
+            metadata=dict(gate["agreement"]),
         )
+        await record_agreement(user_id, tier, gate["agreement"], provider="stripe", checkout_ref=None)
         return CreateCheckoutResponse(url=url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -2744,18 +2874,19 @@ async def get_my_membership(user_id: str, authed: str = Depends(get_current_user
 
 @app.get("/cheri-thread/{user_id}", tags=["Conversations"])
 async def get_cheri_thread(
-    user_id: str, limit: int = 50, authed: str = Depends(get_current_user_id)
+    user_id: str, limit: int = 50, authed: str = Depends(get_member_user_id)
 ):
     """
     Returns the user's last N chat messages with Cheri, oldest first.
     Treats all conversations as one rolling thread (the UX is iMessage-style,
-    not multi-thread). Each item: { role, content, created_at, conversation_id }.
+    not multi-thread). Each item: { id, role, content, created_at, conversation_id }
+    (`id` = chat_history id, used by POST /ai/report).
     """
     require_self(user_id, authed)
     try:
         rows = await supabase.select(
             "chat_history",
-            columns="role,content,created_at,conversation_id",
+            columns="id,role,content,created_at,conversation_id",
             eq={"user_id": user_id},
             order="created_at.desc",
             limit=limit,
@@ -2776,7 +2907,7 @@ async def get_cheri_thread(
 
 @app.get("/conversations/{user_id}/{conversation_id}", response_model=ConversationHistoryResponse, tags=["Conversations"])
 async def get_conversation(
-    user_id: str, conversation_id: str, authed: str = Depends(get_current_user_id)
+    user_id: str, conversation_id: str, authed: str = Depends(get_member_user_id)
 ):
     require_self(user_id, authed)
     try:
@@ -2813,7 +2944,7 @@ async def get_conversation(
 
 
 @app.get("/conversations/{user_id}", tags=["Conversations"])
-async def list_user_conversations(user_id: str, authed: str = Depends(get_current_user_id)):
+async def list_user_conversations(user_id: str, authed: str = Depends(get_member_user_id)):
     require_self(user_id, authed)
     try:
         data = await supabase.select(
@@ -2847,8 +2978,12 @@ async def list_user_conversations(user_id: str, authed: str = Depends(get_curren
         )
 
 
-async def save_conversation_message(user_id: str, conversation_id: str, role: str, content: str, stage: str):
-    await supabase.insert("chat_history", {
+async def save_conversation_message(
+    user_id: str, conversation_id: str, role: str, content: str, stage: str
+) -> Optional[str]:
+    """Insert one chat_history row; returns its id (None when the insert
+    returned no representation). The id lets the app report a reply."""
+    rows = await supabase.insert("chat_history", {
         "user_id": user_id,
         "conversation_id": conversation_id,
         "role": role,
@@ -2856,6 +2991,9 @@ async def save_conversation_message(user_id: str, conversation_id: str, role: st
         "stage": stage,
         "created_at": datetime.now().isoformat(),
     })
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict) and rows[0].get("id") is not None:
+        return str(rows[0]["id"])
+    return None
 
 
 if __name__ == '__main__':

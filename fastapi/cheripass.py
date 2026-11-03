@@ -49,7 +49,7 @@ from ratelimit import rate_limit
 from pydantic import BaseModel, Field
 
 import billing
-from auth import get_current_user_id
+from auth import get_current_user_id, get_member_user_id  # noqa: F401
 from supabase_client import SUPABASE_KEY, supabase
 
 logger = logging.getLogger("cheripic.cheripass")
@@ -184,7 +184,7 @@ class TokenRequest(BaseModel):
 
 
 @router.post("/cheripass/token", dependencies=[Depends(rate_limit("cheripass_token"))])
-async def cheripass_token(req: TokenRequest, user_id: str = Depends(get_current_user_id)) -> dict:
+async def cheripass_token(req: TokenRequest, user_id: str = Depends(get_member_user_id)) -> dict:
     offer_id = _uuid_or_400(req.offer_id)
     offer, member, tier = await asyncio.gather(
         _load_offer(req.offer_kind, offer_id),

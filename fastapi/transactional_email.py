@@ -186,6 +186,7 @@ async def send_transactional_email(
     extra_vars: dict[str, Any] | None = None,
     dedup_window_hours: int = 1,
     related_user_id: str | None = None,
+    essential: bool = False,
 ) -> bool:
     """
     Send `template_slug` to `user_id`. Returns True on success, False on
@@ -199,6 +200,10 @@ async def send_transactional_email(
     successfully sent within this many hours. Set to 0 to disable
     dedup for emails that legitimately can fire multiple times (e.g.
     payment_successful for separate invoices).
+
+    essential: account notices the member must receive whatever their email
+    preference (moderation decisions and how to appeal them). The opt-out
+    covers notification email, not decisions about the account.
     """
     async with httpx.AsyncClient() as client:
         # 1. Recipient
@@ -221,6 +226,8 @@ async def send_transactional_email(
         # TRUE server-side and NULL is treated as TRUE for safety.
         email_pref_on = profile.get("notify_email_enabled")
         email_pref_on = True if email_pref_on is None else bool(email_pref_on)
+        if essential:
+            email_pref_on = True
         push_pref_on = profile.get("notify_push_enabled")
         push_pref_on = True if push_pref_on is None else bool(push_pref_on)
 

@@ -35,7 +35,7 @@ import time
 import logging
 
 import httpx
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -244,3 +244,58 @@ def require_self(path_user_id: str, authed_user_id: str) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You can only access your own data.",
         )
+
+
+# --------------------------------------------------------------------------
+# Account standing (compliance contract, migration 057 — NOT APPLIED)
+# --------------------------------------------------------------------------
+
+STANDING_MESSAGES = {
+    "account_terminated": "This account has been closed. You can still appeal the decision, "
+                          "download your data or delete your account.",
+    "account_restricted": "Your account is restricted right now, so you can't contact members. "
+                          "You can request a review of this decision in Settings.",
+}
+
+
+def _standing_error(code: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"code": code, "message": STANDING_MESSAGES[code]},
+    )
+
+
+async def require_good_standing(user_id: str, *, contact: bool = False) -> str:
+    """
+    Reads `member_standing` through the service role (compliance.py; any
+    missing RPC / error → 'active', so nothing changes before 057).
+
+      terminated            → 403 account_terminated (every member endpoint
+                               except deletion, export, appeals and consent)
+      restricted/suspended  → 403 account_restricted, only when `contact`
+                               (interest + message notify routes,
+                               /connect/activate, /connect/introductions)
+
+    Returns the standing string.
+    """
+    import compliance  # local: compliance imports supabase_client (env-checked)
+
+    standing = await compliance.member_standing(user_id)
+    if standing == "terminated":
+        raise _standing_error("account_terminated")
+    if contact and standing in ("restricted", "suspended"):
+        raise _standing_error("account_restricted")
+    return standing
+
+
+async def get_member_user_id(user_id: str = Depends(get_current_user_id)) -> str:
+    """get_current_user_id + 'not terminated'. Depends on get_current_user_id
+    so test dependency_overrides on it still apply."""
+    await require_good_standing(user_id)
+    return user_id
+
+
+async def get_contact_user_id(user_id: str = Depends(get_current_user_id)) -> str:
+    """get_current_user_id + 'not terminated / restricted / suspended'."""
+    await require_good_standing(user_id, contact=True)
+    return user_id

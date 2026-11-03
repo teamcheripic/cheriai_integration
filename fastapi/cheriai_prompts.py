@@ -240,8 +240,8 @@ class CheriAIPromptBuilder:
                 nm = match.get("nick_name") or match.get("full_name")
                 if nm:
                     bits.append(nm)
-                if "compatibility_score" in match:
-                    bits.append(f"{match['compatibility_score']}% compatible")
+                # No "% compatible" phrasing: introductions are
+                # reflection-based, not a validated compatibility score.
                 if bits:
                     parts.append(f"They're looking at a match: {', '.join(bits)}.")
 
@@ -370,9 +370,8 @@ class CheriAIPromptBuilder:
         if background:
             detail_lines.append(f"Background: {background}")
 
-        religion = _trim(bio.get("religion"), 60)
-        if religion:
-            detail_lines.append(f"Religion: {religion}")
+        # Religion is deliberately NOT sent to the model (special-category
+        # data; compliance contract, CheriAI).
 
         if not head and not detail_lines:
             return ""

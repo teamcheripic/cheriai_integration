@@ -103,6 +103,9 @@ class ProviderSettings:
 class BillingUser:
     id: str
     email: Optional[str] = None
+    # Extra provider metadata (e.g. purchase agreement versions). Providers
+    # that support metadata attach it next to their own user reference.
+    metadata: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

@@ -230,8 +230,9 @@ def test_checkout_session_mode_uses_billing(client, monkeypatch):
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_x")
     seen = {}
 
-    async def fake_session(user_id, price_id, success_url, cancel_url):
-        seen.update(user_id=user_id, price_id=price_id, success_url=success_url, cancel_url=cancel_url)
+    async def fake_session(user_id, price_id, success_url, cancel_url, extra_metadata=None):
+        seen.update(user_id=user_id, price_id=price_id, success_url=success_url, cancel_url=cancel_url,
+                    extra_metadata=extra_metadata)
         return "https://checkout.stripe.com/c/pay/cs_1"
 
     monkeypatch.setattr(billing, "create_checkout_session", fake_session)
@@ -278,7 +279,9 @@ def test_checkout_sdk_mode_params_shape(client, monkeypatch):
     assert p["client_secret"] == "pi_secret_1" and p["ephemeral_key"] == "ek_test_1"
     assert p["customer"] == "cus_1" and p["publishable_key"] == "pk_test_1"
     assert calls["sub"]["items"] == [{"price": "price_lite_1"}]
-    assert calls["sub"]["metadata"] == {"cheripic_user_id": U}
+    # Legacy client (no agreement key, no mobile header) → implicit-legacy versions.
+    assert calls["sub"]["metadata"] == {"cheripic_user_id": U, "terms_version": "implicit-legacy",
+                                        "subscription_terms_version": "implicit-legacy"}
 
 
 @respx.mock

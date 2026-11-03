@@ -40,7 +40,7 @@ from fastapi import APIRouter, Depends, Request
 from ratelimit import rate_limit
 from pydantic import BaseModel
 
-from auth import get_current_user_id
+from auth import get_current_user_id, get_member_user_id  # noqa: F401
 from supabase_client import SUPABASE_KEY, SUPABASE_URL
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ async def clear_withdrawn_proposal_notice(match_id: str, caller_id: str) -> dict
 @router.post("/matching/notify-official-withdrawn", tags=["Matching"], dependencies=[Depends(rate_limit("notify"))])
 async def matching_notify_official_withdrawn(
     req: OfficialWithdrawnRequest,
-    caller_user_id: str = Depends(get_current_user_id),
+    caller_user_id: str = Depends(get_member_user_id),
 ):
     """Never raises: the withdrawal already succeeded; this is inbox hygiene."""
     try:

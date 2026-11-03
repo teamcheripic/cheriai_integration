@@ -16,6 +16,9 @@ POST /connect/activate
     reflection score >= 70, not in an official pair) and only then sets
     bio.connect_active=true, relationship_focus='single', intros_paused=false.
     Otherwise 409 {code:'not_ready', missing:[...], profile_fields:[...]}.
+    Compliance gates first (403 {code, message}): account_restricted /
+    account_terminated (standing), under_minimum_age (min_member_age, 21 by
+    default), country_unavailable (country_allows(country,'connect')).
 
 POST /connect/introductions  {paused: bool}
     Pausing is always allowed. Turning introductions ON applies the same
@@ -45,7 +48,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from ratelimit import rate_limit
 from pydantic import BaseModel, Field
 
-from auth import get_current_user_id
+import compliance
+from auth import get_contact_user_id, get_member_user_id, require_good_standing
 from supabase_client import SUPABASE_KEY, SUPABASE_URL
 from transactional_email import send_transactional_email
 
@@ -174,7 +178,7 @@ def _in(ids: list[str]) -> str:
 
 async def compute_readiness(client: httpx.AsyncClient, user_id: str) -> dict[str, Any]:
     profiles = await _get(client, "user_profiles", {
-        "select": "user_id,bio,gender,verification_final_status",
+        "select": "user_id,bio,gender,verification_final_status,date_of_birth,country_of_residence",
         "user_id": f"eq.{user_id}", "limit": "1",
     })
     profile = profiles[0] if profiles else None
@@ -200,6 +204,22 @@ async def compute_readiness(client: httpx.AsyncClient, user_id: str) -> dict[str
     if official:
         missing.append("official")
     return {"profile": profile, "score": score, "missing": missing, "profile_fields": profile_fields}
+
+
+async def _connect_compliance_gates(profile: dict[str, Any] | None) -> None:
+    """Minimum age + country_allows(country,'connect'). A missing profile is
+    left to the readiness check (409 not_ready). Missing DOB blocks: Connect
+    needs a verified identity, which always carries a DOB."""
+    if not profile:
+        return
+    min_age = await compliance.min_member_age()
+    age = compliance.age_from_dob(profile.get("date_of_birth"))
+    if age is None or age < min_age:
+        raise HTTPException(status_code=403, detail={
+            "code": "under_minimum_age", "message": f"You must be {min_age} or older to use Connect."})
+    if not await compliance.country_allows(profile.get("country_of_residence"), "connect"):
+        raise HTTPException(status_code=403, detail={
+            "code": "country_unavailable", "message": "Connect isn't available in your country yet."})
 
 
 def _not_ready(r: dict[str, Any]) -> HTTPException:
@@ -363,7 +383,7 @@ async def _send_completed_email(user_id: str, score: int, eligible: bool) -> Non
 # ------------------------------------------------------------------ routes
 
 @router.post("/assessment/submit", tags=["Assessment"], dependencies=[Depends(rate_limit("assessment_submit"))])
-async def assessment_submit(req: AssessmentSubmit, caller_user_id: str = Depends(get_current_user_id)):
+async def assessment_submit(req: AssessmentSubmit, caller_user_id: str = Depends(get_member_user_id)):
     async with httpx.AsyncClient(timeout=20.0) as client:
         result = await score_session(client, caller_user_id, req)
     await _send_completed_email(caller_user_id, result["score"], result["eligible"])
@@ -371,9 +391,10 @@ async def assessment_submit(req: AssessmentSubmit, caller_user_id: str = Depends
 
 
 @router.post("/connect/activate", tags=["Connect"], dependencies=[Depends(rate_limit("connect_state"))])
-async def connect_activate(caller_user_id: str = Depends(get_current_user_id)):
+async def connect_activate(caller_user_id: str = Depends(get_contact_user_id)):
     async with httpx.AsyncClient(timeout=20.0) as client:
         r = await compute_readiness(client, caller_user_id)
+        await _connect_compliance_gates(r.get("profile"))
         if r["missing"]:
             raise _not_ready(r)
         # Not official (checked above), so un-pausing is allowed.
@@ -383,10 +404,13 @@ async def connect_activate(caller_user_id: str = Depends(get_current_user_id)):
 
 
 @router.post("/connect/introductions", tags=["Connect"], dependencies=[Depends(rate_limit("connect_state"))])
-async def connect_introductions(body: IntroductionsBody, caller_user_id: str = Depends(get_current_user_id)):
+async def connect_introductions(body: IntroductionsBody, caller_user_id: str = Depends(get_member_user_id)):
     async with httpx.AsyncClient(timeout=20.0) as client:
         if not body.paused:
+            # Turning introductions ON is contact; pausing is always allowed.
+            await require_good_standing(caller_user_id, contact=True)
             r = await compute_readiness(client, caller_user_id)
+            await _connect_compliance_gates(r.get("profile"))
             if r["missing"]:
                 raise _not_ready(r)
         await merge_bio(client, caller_user_id,

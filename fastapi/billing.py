@@ -18,6 +18,8 @@ Setup checklist (one-time, in https://dashboard.stripe.com):
         customer.subscription.deleted
         invoice.payment_succeeded
         invoice.payment_failed
+        charge.refunded            (full refund → paid access revoked)
+        charge.dispute.created     (dispute → paid access revoked + flagged)
   - Put two env vars in ai_integration/fastapi/.env:
         STRIPE_SECRET_KEY=sk_test_…   (or sk_live_…)
         STRIPE_WEBHOOK_SECRET=whsec_…
@@ -27,7 +29,7 @@ from __future__ import annotations
 
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from supabase_client import supabase
@@ -36,6 +38,29 @@ logger = logging.getLogger(__name__)
 
 class WebhookSignatureError(Exception):
     """Stripe webhook payload/signature could not be verified (→ HTTP 400)."""
+
+
+# Compliance contract: a paid membership whose current_period_end is more
+# than this many days in the past is treated as expired on every tier read
+# (a missed renewal/cancel webhook can't keep paid access alive forever).
+MEMBERSHIP_GRACE_DAYS = 3
+
+
+def membership_expired(row: Optional[dict], now: Optional[datetime] = None) -> bool:
+    """True when the row's current_period_end is older than now - grace.
+    No period end (basic, legacy rows, admin grants) → never expired."""
+    if not row:
+        return False
+    raw = row.get("current_period_end")
+    if not raw:
+        return False
+    try:
+        end = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return end < (now or datetime.now(timezone.utc)) - timedelta(days=MEMBERSHIP_GRACE_DAYS)
 
 
 # Lazy-imported so the module loads even if stripe isn't pip-installed yet
@@ -117,13 +142,18 @@ async def create_checkout_session(
     price_id: str,
     success_url: str,
     cancel_url: str,
+    extra_metadata: Optional[dict] = None,
 ) -> str:
-    """Returns the hosted-checkout URL the frontend should redirect to."""
+    """Returns the hosted-checkout URL the frontend should redirect to.
+    `extra_metadata` (e.g. agreement versions) is added to the session and
+    subscription metadata next to cheripic_user_id."""
     if not price_id or not price_id.startswith("price_"):
         raise ValueError("price_id must be a Stripe Price ID (price_…)")
 
     stripe = _get_stripe()
     customer_id = await _find_or_create_customer(user_id)
+    metadata = {**{k: str(v) for k, v in (extra_metadata or {}).items() if v is not None},
+                "cheripic_user_id": user_id}
 
     session = stripe.checkout.Session.create(
         mode="subscription",
@@ -134,9 +164,9 @@ async def create_checkout_session(
         # The webhook reads these from the resulting event so it can update
         # the right CheriPic user without trusting the client.
         client_reference_id=user_id,
-        metadata={"cheripic_user_id": user_id},
+        metadata=metadata,
         subscription_data={
-            "metadata": {"cheripic_user_id": user_id},
+            "metadata": metadata,
         },
         allow_promotion_codes=True,
     )
@@ -436,6 +466,10 @@ async def handle_event(payload: bytes, signature: str) -> dict:
         elif event_type == "invoice.payment_failed":
             await _handle_invoice(obj, status="failed")
             handled = True
+        elif event_type == "charge.refunded":
+            handled = await _handle_charge_refunded(obj)
+        elif event_type == "charge.dispute.created":
+            handled = await _handle_dispute_created(obj)
         else:
             logger.info("Ignoring Stripe event type %s", event_type)
     except Exception:
@@ -719,13 +753,15 @@ async def _get_current_membership(user_id: str) -> dict:
     try:
         rows = await supabase.select(
             "user_memberships",
-            columns="tier,stripe_subscription_id,cancel_at_period_end",
+            columns="tier,stripe_subscription_id,cancel_at_period_end,current_period_end",
             eq={"user_id": user_id, "is_active": True},
             limit=1,
         )
         if rows:
             row = dict(rows[0])
             row["tier"] = row.get("tier") or "basic"
+            if membership_expired(row):
+                row["tier"] = "basic"
             return row
     except Exception:
         pass
@@ -872,10 +908,105 @@ async def _handle_invoice(inv: dict, *, status: str) -> None:
 
 
 # -----------------------------------------------------------------------------
+# Refunds + disputes (compliance contract "Webhooks")
+# -----------------------------------------------------------------------------
+async def _membership_for_customer(customer_id: Optional[str]) -> Optional[dict]:
+    if not customer_id:
+        return None
+    try:
+        rows = await supabase.select(
+            "user_memberships",
+            columns="user_id,tier,stripe_subscription_id,stripe_customer_id",
+            eq={"stripe_customer_id": customer_id, "is_active": True},
+            limit=1,
+        )
+        return rows[0] if rows else None
+    except Exception as e:
+        logger.warning("[billing] membership lookup by customer failed: %r", e)
+        return None
+
+
+async def _revoke_paid_access(charge: dict, *, reason: str) -> bool:
+    """Drop the member owning `charge` to basic and cancel their Stripe
+    subscription (so neither a renewal nor the reconcile job re-grants it).
+    Logs counts/ids only — no card or amount details."""
+    user_id = _user_id_from_object(charge)
+    cust_id = charge.get("customer")
+    row = await _membership_for_customer(cust_id)
+    if not user_id and row:
+        user_id = row.get("user_id")
+    if not user_id:
+        logger.warning("[billing] %s: no CheriPic member found for the charge; nothing revoked", reason)
+        return False
+    sub_id = (row or {}).get("stripe_subscription_id")
+    if sub_id:
+        try:
+            import asyncio
+
+            stripe = _get_stripe()
+            await asyncio.to_thread(stripe.Subscription.cancel, sub_id)
+        except Exception as e:
+            # Already-cancelled is fine; anything else is logged — access is
+            # still revoked locally below.
+            logger.warning("[billing] %s: subscription cancel failed: %s", reason, type(e).__name__)
+    await _upsert_active_membership(
+        user_id=user_id,
+        tier="basic",
+        stripe_customer_id=cust_id,
+        stripe_subscription_id=None,
+        stripe_price_id=None,
+        current_period_start=None,
+        current_period_end=None,
+        cancel_at_period_end=False,
+        last_invoice_status=reason,
+    )
+    logger.warning("[billing] paid access revoked (%s) for member %s", reason, user_id)
+    return True
+
+
+async def _handle_charge_refunded(charge: dict) -> bool:
+    """charge.refunded — only a FULL refund revokes paid access."""
+    amount = _as_int(charge.get("amount")) or 0
+    refunded = _as_int(charge.get("amount_refunded")) or 0
+    full = bool(charge.get("refunded")) or (amount > 0 and refunded >= amount)
+    if not full:
+        logger.info("[billing] partial refund; access unchanged")
+        return True
+    return await _revoke_paid_access(charge, reason="refunded")
+
+
+async def _handle_dispute_created(dispute: dict) -> bool:
+    """charge.dispute.created — revoke paid access and flag for admin review
+    (last_invoice_status='disputed', which the admin panel shows, plus a
+    WARNING log line)."""
+    charge: dict = {}
+    ch = dispute.get("charge")
+    if isinstance(ch, dict):
+        charge = ch
+    elif isinstance(ch, str) and ch:
+        try:
+            import asyncio
+
+            stripe = _get_stripe()
+            charge = _plain(await asyncio.to_thread(stripe.Charge.retrieve, ch)) or {}
+        except Exception as e:
+            logger.warning("[billing] dispute: charge lookup failed: %s", type(e).__name__)
+    if not charge:
+        charge = {"customer": dispute.get("customer"), "metadata": dispute.get("metadata") or {}}
+    ok = await _revoke_paid_access(charge, reason="disputed")
+    logger.warning("[billing] ADMIN FLAG: payment dispute %s opened (reason=%s)",
+                   dispute.get("id"), dispute.get("reason"))
+    return ok
+
+
+# -----------------------------------------------------------------------------
 # H13.17 · Daily subscription reconciliation (ENABLE_STRIPE_RECONCILE)
 # -----------------------------------------------------------------------------
 def reconcile_enabled() -> bool:
-    return (os.getenv("ENABLE_STRIPE_RECONCILE") or "").strip().lower() in ("1", "true", "yes", "on")
+    """On by default (compliance contract); ENABLE_STRIPE_RECONCILE=false
+    (or 0 / no / off) turns it off."""
+    raw = (os.getenv("ENABLE_STRIPE_RECONCILE") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def _iso_to_epoch(v) -> Optional[int]:
@@ -1138,13 +1269,18 @@ async def release_message(user_id: str, period_start: str) -> None:
 
 
 async def get_membership_tier(user_id: str) -> str:
+    """Active tier, expiry-aware: a paid row whose current_period_end is more
+    than MEMBERSHIP_GRACE_DAYS in the past reads as basic."""
     rows = await supabase.select(
         "user_memberships",
-        columns="tier",
+        columns="tier,current_period_end",
         eq={"user_id": user_id, "is_active": True},
         limit=1,
     )
     t = rows[0]["tier"] if rows else "basic"
     if t not in ("basic", "premium-lite", "premium"):
+        t = "basic"
+    if rows and t != "basic" and membership_expired(rows[0]):
+        logger.info("[billing] membership period ended > %dd ago; reading as basic", MEMBERSHIP_GRACE_DAYS)
         t = "basic"
     return t

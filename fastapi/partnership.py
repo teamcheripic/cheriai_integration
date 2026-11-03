@@ -507,6 +507,13 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
                 # (b) Delete all messages in the side match. Messages
                 # between the TWO PARTNERS themselves are untouched —
                 # the sweep already excludes match_id via id.neq.
+                # Evidence first (057): copied to preserved_content when
+                # either side has an open report or an active legal hold.
+                import compliance
+
+                await compliance.preserve_match_messages(
+                    [sm_id], [uid, third_party], reason="partnership_sweep", subject_user_id=third_party
+                )
                 await _pg_delete(
                     client,
                     "match_messages",

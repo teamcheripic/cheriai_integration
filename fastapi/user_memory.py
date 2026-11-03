@@ -154,6 +154,26 @@ _SEED_SYSTEM = (
 )
 
 
+def _age_from_dob(dob: Any) -> Any:
+    from datetime import date
+
+    if not dob:
+        return None
+    try:
+        d = date.fromisoformat(str(dob)[:10])
+    except ValueError:
+        return None
+    t = date.today()
+    return t.year - d.year - ((t.month, t.day) < (d.month, d.day))
+
+
+async def _ai_consent_ok(user_id: str) -> bool:
+    """CheriAI consent (056 ai_consent_at). Column missing → True."""
+    import compliance
+
+    return await compliance.has_ai_consent(user_id) is True
+
+
 def _build_seed_prompt(profile: dict[str, Any], bio: dict[str, Any]) -> str:
     """Serialize the user_profiles row + bio JSON into a compact bullet list."""
     def _pair(label: str, val: Any) -> str | None:
@@ -162,13 +182,16 @@ def _build_seed_prompt(profile: dict[str, Any], bio: dict[str, Any]) -> str:
         s = str(val).strip()
         return f"- {label}: {s}" if s else None
 
+    profile = dict(profile)
+    # Age, not the full date of birth: the model needs no more than that.
+    profile["age"] = _age_from_dob(profile.pop("date_of_birth", None))
     lines: list[str] = []
     lines.append("Profile fields")
     for label, key in [
         ("Nick name", "nick_name"),
         ("Full name", "full_name"),
         ("Gender", "gender"),
-        ("Date of birth", "date_of_birth"),
+        ("Age", "age"),
         ("Nationality", "nationality"),
         ("Country of residence", "country_of_residence"),
     ]:
@@ -180,7 +203,6 @@ def _build_seed_prompt(profile: dict[str, Any], bio: dict[str, Any]) -> str:
     lines.append("Snapshot Bio (JSON)")
     for label, key in [
         ("Height", "height"),
-        ("Religion", "religion"),
         ("Background", "background"),
         ("Profession", "profession"),
         ("Intent", "intent"),
@@ -224,6 +246,9 @@ async def seed_memory_from_profile(user_id: str) -> dict[str, Any]:
     raises, callers just log and move on).
     """
     try:
+        if not await _ai_consent_ok(user_id):
+            logger.info(f"[memory-seed] no CheriAI consent for {user_id}; skipping")
+            return {}
         # 1. Load the profile row. Only fields we can distill from.
         rows = await supabase.select(
             "user_profiles",
@@ -359,6 +384,10 @@ async def update_memory_async(
             )
             current_short = await load_memory(user_id)
             await _touch_memory_row(user_id, current_short)
+            return
+
+        if not await _ai_consent_ok(user_id):
+            logger.info(f"[memory] no CheriAI consent for {user_id}; distill skipped")
             return
 
         current = await load_memory(user_id)

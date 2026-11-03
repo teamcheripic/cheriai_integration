@@ -334,9 +334,10 @@ def test_reconcile_job_is_scheduled_only_when_enabled(monkeypatch):
         def add_job(self, fn, trigger, **kw):
             self.jobs.append((fn, kw["id"]))
 
-    monkeypatch.delenv("ENABLE_STRIPE_RECONCILE", raising=False)
+    # Compliance contract: on by default; ENABLE_STRIPE_RECONCILE=false turns it off.
+    monkeypatch.setenv("ENABLE_STRIPE_RECONCILE", "false")
     s = Sched()
     assert main._schedule_stripe_reconcile(s) is False and s.jobs == []
-    monkeypatch.setenv("ENABLE_STRIPE_RECONCILE", "true")
+    monkeypatch.delenv("ENABLE_STRIPE_RECONCILE", raising=False)
     assert main._schedule_stripe_reconcile(s) is True
     assert s.jobs == [(billing.reconcile_subscriptions, "stripe_reconcile")]

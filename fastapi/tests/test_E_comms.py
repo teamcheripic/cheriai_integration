@@ -128,6 +128,15 @@ async def test_email_opt_out_skips_email():
 
 
 @respx.mock
+async def test_email_opt_out_still_sends_essential_account_notice():
+    _, _, resend = _mock_email_env(
+        profile={"email": "jane@example.com", "notify_email_enabled": False, "notify_push_enabled": False}
+    )
+    assert await te.send_transactional_email(U, "account_suspended", essential=True) is True
+    assert resend.called
+
+
+@respx.mock
 async def test_email_provider_error_recorded_as_failed():
     _, audit, resend = _mock_email_env()
     resend.mock(return_value=httpx.Response(422, json={"message": "bad"}))

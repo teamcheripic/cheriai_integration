@@ -13,6 +13,8 @@ Accepts either:
   send_to_llm((system_str, user_str))
 so existing callers using a single string still work.
 """
+import hashlib
+import logging
 import os
 import httpx
 from dotenv import load_dotenv
@@ -28,6 +30,30 @@ _DEFAULT_SYSTEM = (
     "Reply in 2–3 short sentences, plain language, no bullet points. "
     "Ask at most one question per reply."
 )
+
+
+_logger = logging.getLogger(__name__)
+_SALT_FALLBACK = "cheripic-openai-user-v1"
+_salt_warned = False
+
+
+def _user_hash_salt() -> str:
+    global _salt_warned
+    salt = (os.getenv("CHERIAI_USER_HASH_SALT") or "").strip()
+    if salt:
+        return salt
+    if not _salt_warned:
+        _logger.warning("CHERIAI_USER_HASH_SALT not set; using a derived constant salt for the OpenAI user hash")
+        _salt_warned = True
+    # Derived from the project URL so it differs per deployment even unset.
+    base = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
+    return hashlib.sha256(f"{_SALT_FALLBACK}|{base}".encode()).hexdigest()
+
+
+def hashed_openai_user(user_id: str) -> str:
+    """SHA-256(salt + user id). OpenAI's `user` field only ever gets this,
+    never the member's real id (compliance contract, CheriAI)."""
+    return hashlib.sha256(f"{_user_hash_salt()}:{user_id}".encode()).hexdigest()
 
 
 class LLMResponseError(RuntimeError):
@@ -164,7 +190,9 @@ async def send_to_llm_with_usage(
         # cheriai_prompts.py system message already includes it.
         payload["response_format"] = {"type": "json_object"}
     if user:
-        payload["user"] = user  # helps OpenAI's abuse heuristics, no cost
+        # Hashed id only — helps OpenAI's abuse heuristics without sharing
+        # the member's real id.
+        payload["user"] = hashed_openai_user(user)
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
