@@ -402,7 +402,7 @@ def shop(monkeypatch, member):
     prov = FakeProvider()
     recorded = []
     monkeypatch.setattr(payments_api.registry, "resolve_active",
-                        lambda: _a(Resolution(provider=prov, configured_active="stripe")))
+                        lambda **_: _a(Resolution(provider=prov, configured_active="stripe")))
 
     async def record(row):
         recorded.append(row)

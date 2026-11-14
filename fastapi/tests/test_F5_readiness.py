@@ -324,9 +324,9 @@ def test_router_registered_in_main_feature_loop():
 _MIG = os.path.join(os.path.dirname(__file__), "..", "migrations")
 
 
-def test_053_guard_is_marked_unapplied_and_parses():
+def test_053_guard_is_marked_applied_and_parses():
     src = open(os.path.join(_MIG, "053_connect_eligibility_guard.sql")).read()
-    assert src.startswith("-- NOT APPLIED — needs approval")
+    assert src.startswith("-- APPLIED — verified live 2026-11-03")
     for needle in ("trg_guard_reflection_score", "trg_guard_assessment_session", "trg_guard_user_profiles_connect",
                    "current_user NOT IN ('authenticated', 'anon')", "public.is_admin()"):
         assert needle in src

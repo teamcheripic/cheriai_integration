@@ -1480,6 +1480,17 @@ async def matching_notify_unmatch(
             and ended.get("partner_accepted_by_b")
         )
 
+        # The other member of an OFFICIAL end defaults to paused (handoff §9)
+        # BEFORE anything that can return early (duplicate guard, notification
+        # insert), so a failed or retried notice never leaves them visible to
+        # discovery. Idempotent per ended match.
+        if was_official:
+            try:
+                paused = await pause_partner_after_official_end(caller_user_id, req.other_user_id)
+                logger.info("[unmatch-notify] other member defaulted to paused=%s", paused)
+            except Exception as e:
+                logger.warning("[unmatch-notify] pause-after-official-end failed: %r", e)
+
         # Idempotency: a retried call must not duplicate the notices/email.
         if await recent_notification_exists(req.other_user_id, "unmatched", caller_user_id, minutes=10):
             logger.info("[unmatch-notify] duplicate call for caller=%s other=%s — skipped", caller_user_id, req.other_user_id)
@@ -1564,11 +1575,6 @@ async def matching_notify_unmatch(
         # end stays in-app only. The initiator isn't emailed about their
         # own action. Fire-and-forget — the unmatch already succeeded.
         if was_official:
-            try:
-                paused = await pause_partner_after_official_end(caller_user_id, req.other_user_id)
-                logger.info("[unmatch-notify] other member defaulted to paused=%s", paused)
-            except Exception as e:
-                logger.warning("[unmatch-notify] pause-after-official-end failed: %r", e)
             try:
                 await send_transactional_email(
                     user_id=req.other_user_id,

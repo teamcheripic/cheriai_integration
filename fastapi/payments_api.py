@@ -6,6 +6,8 @@ Member
   POST /billing/checkout             { tier, platform, prefer?, success_url?, cancel_url?,
                                        agreement?: {accepted, terms_version, subscription_terms_version} }
   POST /billing/portal               { return_url? } → member's OWN provider
+  POST /billing/app-store/sync       re-read the member from RevenueCat after an
+                                     in-app purchase / restore (store billing)
 Provider
   POST /billing/webhook/{provider}   signature-verified per provider
 Admin
@@ -104,8 +106,9 @@ def _tiers_block() -> Dict[str, Dict[str, bool]]:
 # Member endpoints
 # =============================================================================
 @router.get("/billing/config", tags=["Billing"], dependencies=[Depends(rate_limit("billing_config"))])
-async def billing_config(user_id: str = Depends(get_member_user_id)):
-    res = await registry.resolve_active()
+async def billing_config(platform: str = "web", user_id: str = Depends(get_member_user_id)):
+    # ios/android → the store provider only (store rules); web → admin's active.
+    res = await registry.resolve_for_platform(platform if platform in PLATFORMS else "web")
     p = res.provider
     if p is None or not _ready_for_sale(p):
         if p is not None:
@@ -120,6 +123,13 @@ async def billing_config(user_id: str = Depends(get_member_user_id)):
             "failover": False,
             "tiers": _tiers_block(),
         }
+    tiers = _tiers_block()
+    if p.id == registry.STORE_PROVIDER_ID:
+        # The app shows the store's own localized price for these products.
+        for t, block in tiers.items():
+            product = p.product_for(t, platform)  # type: ignore[attr-defined]
+            if product and block["purchasable"]:
+                block["product_id"] = product  # type: ignore[assignment]
     return {
         "provider": p.id,
         "display_name": p.settings.display_name,
@@ -128,7 +138,7 @@ async def billing_config(user_id: str = Depends(get_member_user_id)):
         "available": True,
         "message": None,
         "failover": res.failover,
-        "tiers": _tiers_block(),
+        "tiers": tiers,
     }
 
 
@@ -156,6 +166,18 @@ MSG_TERMINATED = "This account has been closed, so it can't buy a membership."
 MSG_COUNTRY = "Memberships aren't available in your country yet."
 MSG_AGREEMENT = "Please accept the Terms and the subscription terms to continue."
 MSG_ALREADY = "You already have this membership (or a higher one). Manage it in Manage subscription."
+# Native apps never link to another payment system (store anti-steering rules).
+MSG_MANAGED_ELSEWHERE = (
+    "Your membership was bought on the CheriPic website, so it's managed there. "
+    "Sign in to CheriPic in a web browser to change or cancel it."
+)
+
+
+def is_native_client(request: Optional[Request], platform: Optional[str] = None) -> bool:
+    if platform in registry.NATIVE_PLATFORMS:
+        return True
+    hdr = (request.headers.get(MOBILE_CLIENT_HEADER) if request is not None else None) or ""
+    return hdr.strip().lower() == "mobile"
 
 
 class CheckoutGateError(Exception):
@@ -275,9 +297,16 @@ async def billing_checkout(body: CheckoutBody, request: Request, user_id: str = 
     success_url = safe_return_url(body.success_url, "/#/profile?checkout=success") if body.success_url else d_success
     cancel_url = safe_return_url(body.cancel_url, "/#/pricing") if body.cancel_url else d_cancel
 
-    if gate["upgrade"]:
+    native = platform in registry.NATIVE_PLATFORMS
+    existing_provider = (gate["existing"] or {}).get("payment_provider") or "stripe"
+    if gate["upgrade"] and native and existing_provider != registry.STORE_PROVIDER_ID:
+        # Paid on the web: the app may not link out to that billing system.
+        _err(409, "managed_elsewhere", MSG_MANAGED_ELSEWHERE)
+    if gate["upgrade"] and not (native and existing_provider == registry.STORE_PROVIDER_ID):
         # Lite → Premium: change the EXISTING subscription in the member's
         # own billing portal (proration handled there) — never a second one.
+        # (A store subscriber upgrading in the app buys the higher product in
+        # the same subscription group; the store prorates — falls through.)
         try:
             url = await open_portal(user_id, success_url)
         except Exception as e:
@@ -289,7 +318,7 @@ async def billing_checkout(body: CheckoutBody, request: Request, user_id: str = 
         await record_agreement(user_id, body.tier, gate["agreement"], provider=provider_id, checkout_ref="upgrade_portal")
         return {"provider": provider_id, "mode": "redirect", "url": url, "upgrade": "portal"}
 
-    res = await registry.resolve_active()
+    res = await registry.resolve_for_platform(platform)
     p = res.provider
     if p is None:
         _unavailable()
@@ -322,15 +351,24 @@ async def billing_checkout(body: CheckoutBody, request: Request, user_id: str = 
 
 class PortalBody(BaseModel):
     return_url: Optional[str] = None
+    platform: Optional[str] = None
 
 
-async def open_portal(user_id: str, return_url: Optional[str]) -> str:
+class ManagedElsewhere(ProviderError):
+    """Native client, member billed by a web gateway: no link may be shown."""
+
+    code = "managed_elsewhere"
+
+
+async def open_portal(user_id: str, return_url: Optional[str], *, native: bool = False) -> str:
     """Member's OWN provider portal URL. Raises NoSubscription /
-    ProviderError. Used by /billing/portal and the legacy
+    ManagedElsewhere / ProviderError. Used by /billing/portal and the legacy
     /billing/portal-session."""
     m = await registry.get_member_billing(user_id)
     if m is None or not m.customer_id:
         raise NoSubscription("no customer on file")
+    if native and m.payment_provider != registry.STORE_PROVIDER_ID:
+        raise ManagedElsewhere(m.payment_provider)
     p = await registry.get_provider(m.payment_provider)
     if p is None:
         raise ProviderError(f"unknown provider {m.payment_provider}")
@@ -339,11 +377,14 @@ async def open_portal(user_id: str, return_url: Optional[str]) -> str:
 
 # Not standing-gated: a terminated member must still be able to cancel.
 @router.post("/billing/portal", tags=["Billing"], dependencies=[Depends(rate_limit("billing_checkout"))])
-async def billing_portal(body: Optional[PortalBody] = None, user_id: str = Depends(get_current_user_id)):
+async def billing_portal(request: Request, body: Optional[PortalBody] = None, user_id: str = Depends(get_current_user_id)):
+    native = is_native_client(request, body.platform if body else None)
     try:
-        url = await open_portal(user_id, body.return_url if body else None)
+        url = await open_portal(user_id, body.return_url if body else None, native=native)
     except NoSubscription:
         _err(404, "no_subscription", MSG_NO_SUBSCRIPTION)
+    except ManagedElsewhere:
+        _err(409, "managed_elsewhere", MSG_MANAGED_ELSEWHERE)
     except ProviderError as e:
         logger.warning("[payments] portal unavailable: %s (%s)", type(e).__name__, e)
         _unavailable()
@@ -364,7 +405,7 @@ async def legacy_checkout_session(
     active provider's hosted page."""
     import billing
 
-    res = await registry.resolve_active()
+    res = await registry.resolve_active(exclude=(registry.STORE_PROVIDER_ID,))
     p = res.provider
     if p is None or p.id == "stripe":
         return await billing.create_checkout_session(
@@ -382,6 +423,24 @@ async def legacy_checkout_session(
     if result.mode != "redirect" or not _https(result.url):
         raise ProviderError("active provider has no hosted checkout")
     return result.url or ""
+
+
+# Not standing-gated: restoring what the member already paid the store for
+# must always work. The state comes from RevenueCat, never from the client.
+@router.post("/billing/app-store/sync", tags=["Billing"], dependencies=[Depends(rate_limit("billing_checkout"))])
+async def billing_app_store_sync(user_id: str = Depends(get_current_user_id)):
+    p = await registry.get_provider(registry.STORE_PROVIDER_ID)
+    if p is None or not p.implemented or not p.is_configured():
+        _unavailable()
+    try:
+        out = await p.sync_member(user_id)  # type: ignore[attr-defined]
+    except ProviderError as e:
+        logger.warning("[payments] app_store sync unavailable: %s", e)
+        _unavailable()
+    except Exception as e:
+        logger.error("[payments] app_store sync failed: %r", e, exc_info=True)
+        _unavailable()
+    return {"tier": out.get("tier") or "basic", "applied": bool(out.get("applied"))}
 
 
 # =============================================================================
@@ -670,6 +729,10 @@ class SwitchBody(BaseModel):
 def switch_refusals(p: Provider) -> List[tuple]:
     """[(code, message)] reasons `p` can't become active."""
     out = []
+    if p.id == registry.STORE_PROVIDER_ID:
+        out.append(("store_provider_native_only",
+                    "App Store / Google Play sells inside the iOS and Android apps only. Enable it for the apps; "
+                    "it can't be the website's active provider."))
     if not p.settings.enabled:
         out.append(("provider_disabled", "The provider is disabled. Enable it first."))
     if not p.implemented:

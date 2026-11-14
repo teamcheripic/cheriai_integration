@@ -294,9 +294,34 @@ async def auto_failover_enabled() -> bool:
         return False
 
 
-async def resolve_active() -> Resolution:
+# Store billing (App Review 3.1.1 / Google Play Payments policy): native
+# clients buy ONLY through the store provider, and the store provider never
+# sells on the web. The admin "active" switch governs the web only.
+STORE_PROVIDER_ID = "app_store"
+NATIVE_PLATFORMS = ("ios", "android")
+
+
+async def resolve_for_platform(platform: str) -> Resolution:
+    """The provider a checkout on `platform` must use. ios/android → the
+    store provider when usable, otherwise none (never a web gateway, never
+    failover). web → resolve_active() with the store provider excluded."""
+    if platform not in NATIVE_PLATFORMS:
+        return await resolve_active(exclude=(STORE_PROVIDER_ID,))
     snap = await load_snapshot()
-    providers = [build(s) for s in snap.providers]
+    s = snap.get(STORE_PROVIDER_ID)
+    if s is None:
+        return Resolution(provider=None, configured_active=None, source=snap.source,
+                          reasons={STORE_PROVIDER_ID: "missing"})
+    p = build(s)
+    why = unusable_reason(p)
+    if why is None:
+        return Resolution(provider=p, configured_active=p.id, source=snap.source)
+    return Resolution(provider=None, configured_active=None, source=snap.source, reasons={p.id: why})
+
+
+async def resolve_active(exclude: tuple = ()) -> Resolution:
+    snap = await load_snapshot()
+    providers = [build(s) for s in snap.providers if s.id not in exclude]
     active = next((p for p in providers if p.settings.is_active), None)
     reasons: Dict[str, str] = {}
     if active is not None:

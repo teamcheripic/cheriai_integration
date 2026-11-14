@@ -144,6 +144,19 @@ async def test_canceled_status_update_downgrades_and_sends_premium_ended(monkeyp
 
 
 @respx.mock
+async def test_old_stripe_sub_ending_never_downgrades_a_store_subscriber(monkeypatch, emails):
+    """Member left Stripe and now pays through the App Store / Google Play:
+    the old Stripe subscription's deleted event must not touch them."""
+    ev = {"id": "evt_del_store", "type": "customer.subscription.deleted", "created": 1762600001,
+          "data": {"object": _sub(status="canceled")}}
+    _install(monkeypatch, ev)
+    db = _mock_db(membership={"tier": "premium-lite", "stripe_subscription_id": None, "payment_provider": "app_store"})
+    await billing.handle_event(b"{}", "good")
+    assert not db.mem_post.called
+    assert emails == []
+
+
+@respx.mock
 async def test_basic_member_deleted_event_sends_nothing(monkeypatch, emails):
     ev = {"id": "evt_del3", "type": "customer.subscription.deleted", "created": 1,
           "data": {"object": _sub(status="canceled")}}

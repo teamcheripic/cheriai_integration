@@ -168,6 +168,21 @@ def test_notify_unmatch_official_neutral_copy_and_pause(client, monkeypatch, sen
 
 
 @respx.mock
+def test_notify_unmatch_official_pauses_partner_even_if_notice_fails_or_is_duplicate(client, monkeypatch, sent):
+    official = {"id": "m1", "is_active": False, "partner_accepted_by_a": True, "partner_accepted_by_b": True}
+    respx.get(f"{REST}/public_profiles").mock(return_value=httpx.Response(200, json=[]))
+    # Notification insert fails → partner is still paused.
+    paused = _unmatch_env(monkeypatch, ended=official)
+    respx.post(f"{REST}/notifications").mock(return_value=httpx.Response(400, json={"code": "23514"}))
+    assert client.post("/matching/notify-unmatch", json={"other_user_id": B, "was_partnered": True}).json()["ok"] is False
+    assert paused == [(A, B)]
+    # Retried call inside the duplicate window → still (idempotently) paused.
+    paused = _unmatch_env(monkeypatch, ended=official, duplicate=True)
+    assert client.post("/matching/notify-unmatch", json={"other_user_id": B, "was_partnered": True}).json()["skipped"] == "duplicate"
+    assert paused == [(A, B)]
+
+
+@respx.mock
 def test_notify_unmatch_ordinary_no_pause_no_email(client, monkeypatch, sent):
     paused = _unmatch_env(monkeypatch, ended={"id": "m1", "is_active": False})
     respx.get(f"{REST}/public_profiles").mock(return_value=httpx.Response(200, json=[]))

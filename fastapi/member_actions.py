@@ -288,6 +288,29 @@ def _stripe_sub_already_gone(err: Exception) -> bool:
     return code == "resource_missing" or "no such subscription" in msg or "canceled subscription" in msg
 
 
+async def _delete_store_customer(user_id: str) -> int:
+    """Best-effort DELETE of the member's RevenueCat customer (store billing).
+    Never blocks deletion: failures are logged and counted as 0."""
+    import os
+    from urllib.parse import quote
+
+    secret = (os.getenv("REVENUECAT_SECRET") or "").strip()
+    if not secret:
+        return 0
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as rc:
+            r = await rc.delete(
+                f"https://api.revenuecat.com/v1/subscribers/{quote(user_id, safe='')}",
+                headers={"Authorization": f"Bearer {secret}"},
+            )
+        if r.status_code < 300 or r.status_code == 404:
+            return 1 if r.status_code < 300 else 0
+        logger.warning("[delete-account] RevenueCat customer delete failed [%s]", r.status_code)
+    except Exception as e:
+        logger.warning("[delete-account] RevenueCat customer delete error: %r", e)
+    return 0
+
+
 async def _cancel_stripe_subscription(
     client: httpx.AsyncClient, user_id: str, customers_out: Optional[set[str]] = None
 ) -> int:
@@ -568,6 +591,11 @@ async def _delete_account_steps(user_id: str, record: dict[str, Any]) -> dict[st
         record["stripe_cancelled"] = (await _cancel_stripe_subscription(client, user_id, customers)) > 0
         # Not stored on the 051 record (fixed columns) — counted in the log line.
         counts["stripe_customers_deleted"] = await _delete_stripe_customers(customers)
+        # Store billing: CheriPic can't cancel an App Store / Google Play
+        # subscription (the app tells the member to cancel it in the store),
+        # but the RevenueCat customer record is erased so no further store
+        # events reach this deleted member.
+        counts["store_customer_deleted"] = await _delete_store_customer(user_id)
         # Address for the confirmation, captured while the profile exists.
         recipient = await _deletion_recipient(client, user_id)
 

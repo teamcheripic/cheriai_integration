@@ -220,7 +220,7 @@ def test_config_is_cached_and_invalidatable(client, monkeypatch):
 def test_checkout_payment_link_redirect(client, monkeypatch):
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_x")
     mock_db()
-    r = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "ios"})
+    r = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "web"})
     assert r.status_code == 200
     assert r.json() == {"provider": "stripe", "mode": "redirect", "url": f"{LINK}?client_reference_id={U}"}
 
@@ -272,7 +272,7 @@ def test_checkout_sdk_mode_params_shape(client, monkeypatch):
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_x")
     calls = _fake_stripe(monkeypatch)
     mock_db(providers=[prow("stripe", enabled=True, active=True, mode="sdk", pk="pk_test_1")])
-    r = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "android"})
+    r = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "web"})
     b = r.json()
     assert b["provider"] == "stripe" and b["mode"] == "sdk" and "url" not in b
     p = b["params"]
@@ -293,7 +293,7 @@ def test_checkout_sdk_prefer_redirect_returns_hosted_url(client, monkeypatch):
 
     monkeypatch.setattr(billing, "create_checkout_session", fake_session)
     mock_db(providers=[prow("stripe", enabled=True, active=True, mode="sdk")])
-    r = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "ios", "prefer": "redirect"})
+    r = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "web", "prefer": "redirect"})
     assert r.json() == {"provider": "stripe", "mode": "redirect", "url": "https://checkout.stripe.com/c/pay/cs_2"}
 
 
@@ -302,10 +302,10 @@ def test_checkout_sdk_prefer_redirect_without_hosted_page_is_503(client, monkeyp
     monkeypatch.setenv("FAKE_GATEWAY_SECRET", "s")
     mock_db(providers=[prow("paypal", enabled=True, active=True, mode="sdk")],
             prices=[price("paypal", ref="P-PLAN")])
-    sdk = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "ios"}).json()
+    sdk = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "web"}).json()
     assert sdk == {"provider": "paypal", "mode": "sdk",
                    "params": {"order_id": "O-1", "client_id": "pub_x", "tier": "premium-lite"}}
-    r = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "ios", "prefer": "redirect"})
+    r = client.post("/billing/checkout", json={"tier": "premium-lite", "platform": "web", "prefer": "redirect"})
     assert r.status_code == 503 and detail(r)["code"] == "provider_unavailable"
 
 

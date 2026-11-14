@@ -751,12 +751,21 @@ async def _get_current_membership(user_id: str) -> dict:
     """Active membership snapshot {tier, stripe_subscription_id,
     cancel_at_period_end}; tier falls back to 'basic' like _get_current_tier."""
     try:
-        rows = await supabase.select(
-            "user_memberships",
-            columns="tier,stripe_subscription_id,cancel_at_period_end,current_period_end",
-            eq={"user_id": user_id, "is_active": True},
-            limit=1,
-        )
+        try:
+            rows = await supabase.select(
+                "user_memberships",
+                columns="tier,stripe_subscription_id,cancel_at_period_end,current_period_end,payment_provider",
+                eq={"user_id": user_id, "is_active": True},
+                limit=1,
+            )
+        except Exception:
+            # Before 054 there is no payment_provider column (every row is Stripe).
+            rows = await supabase.select(
+                "user_memberships",
+                columns="tier,stripe_subscription_id,cancel_at_period_end,current_period_end",
+                eq={"user_id": user_id, "is_active": True},
+                limit=1,
+            )
         if rows:
             row = dict(rows[0])
             row["tier"] = row.get("tier") or "basic"
@@ -804,6 +813,11 @@ async def _handle_subscription_cancelled(sub: dict, *, send_email: bool = True) 
     prior_tier = prior["tier"]
     ended_sub = sub.get("id")
     current_sub = prior.get("stripe_subscription_id")
+    if (prior.get("payment_provider") or "stripe") != "stripe":
+        # The member now pays through another provider (e.g. the App Store):
+        # an old Stripe subscription ending must not downgrade them.
+        logger.info("[billing] ended Stripe subscription; member is billed by %s — no downgrade", prior.get("payment_provider"))
+        return
     if ended_sub and current_sub and current_sub != ended_sub:
         # A late "deleted" for an OLD subscription must not downgrade a
         # member who has since started a new one (H13.17).

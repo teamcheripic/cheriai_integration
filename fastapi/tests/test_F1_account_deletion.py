@@ -178,7 +178,7 @@ async def test_email_provider_failure_does_not_block_deletion(billing_ok, email_
 def test_migration_051_defines_private_table_and_type_value():
     sql = open(os.path.join(os.path.dirname(__file__), "..", "migrations",
                             "051_account_deletions_and_notification_types.sql")).read()
-    assert sql.startswith("-- NOT APPLIED — needs approval")
+    assert sql.startswith("-- APPLIED — verified live 2026-11-03")
     for col in ("user_id_hash", "requested_at", "completed_at", "status", "retained_tables",
                 "stripe_cancelled", "error"):
         assert col in sql
