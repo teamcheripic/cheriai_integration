@@ -419,6 +419,12 @@ async def lifespan(app: FastAPI):
             kyc_retention.schedule(scheduler)  # ENABLE_KYC_RETENTION, default on
         except Exception as e:
             logger.error("Could not arm the KYC retention job: %r", e)
+        try:
+            import introduction_delivery
+
+            introduction_delivery.schedule(scheduler)  # ENABLE_INTRO_DELIVERY, default on
+        except Exception as e:
+            logger.error("Could not arm the introduction delivery job: %r", e)
         scheduler.start()
         app.state.scheduler = scheduler
         logger.info("Cron supervisor running (15-min reconcile against app_config).")
