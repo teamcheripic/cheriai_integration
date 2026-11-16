@@ -2057,6 +2057,39 @@ async def admin_run_job(job_id: str, admin_user_id: str = Depends(get_current_ad
     return {"started": True, "job": job_id}
 
 
+class AdminWipeMembersRequest(BaseModel):
+    confirm: str
+
+
+WIPE_MEMBERS_PHRASE = "DELETE ALL MEMBERS"
+
+
+@app.get("/admin/wipe/members/preview", tags=["Admin"])
+async def admin_wipe_members_preview(admin_user_id: str = Depends(get_current_admin_id)):
+    """How many members a full wipe would delete, and how many are kept."""
+    import admin_wipe
+
+    plan = await admin_wipe.wipe_targets()
+    return {"to_delete": len(plan["targets"]), "kept_admins": plan["admins"], "kept_protected": plan["protected"]}
+
+
+@app.post("/admin/wipe/members", tags=["Admin"])
+async def admin_wipe_members(req: AdminWipeMembersRequest, admin_user_id: str = Depends(get_current_admin_id)):
+    """Delete every member completely (admin_wipe.py). Requires the exact
+    confirmation phrase. Runs in the background; progress and the outcome are
+    recorded in job_runs as job "wipe_members"."""
+    import asyncio
+    import admin_wipe
+    import scheduled_jobs
+
+    if req.confirm.strip() != WIPE_MEMBERS_PHRASE:
+        raise HTTPException(status_code=422, detail={"code": "confirmation_required",
+                                                     "message": f'Type "{WIPE_MEMBERS_PHRASE}" to confirm.'})
+    logger.warning("[wipe-members] started by admin=%s", admin_user_id)
+    asyncio.create_task(scheduled_jobs.run_recorded("wipe_members", admin_wipe.wipe_members, f"admin:{admin_user_id}"))
+    return {"started": True, "job": "wipe_members"}
+
+
 @app.post("/admin/invalidate-app-config-cache", tags=["Admin"])
 async def admin_invalidate_app_config_cache(
     admin_user_id: str = Depends(get_current_admin_id),

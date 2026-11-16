@@ -143,11 +143,15 @@ async def _record_end(client: httpx.AsyncClient, run_id: Optional[int], status: 
 
 async def run_job(job_id: str, triggered_by: str = "schedule") -> dict[str, Any]:
     """Run one job now, recording it in job_runs. Never raises."""
-    job = JOBS[job_id]
+    return await run_recorded(job_id, JOBS[job_id].func, triggered_by)
+
+
+async def run_recorded(job_id: str, func: Callable[[], Awaitable[Any]], triggered_by: str) -> dict[str, Any]:
+    """Run any task with a job_runs record (also used by admin wipes). Never raises."""
     async with httpx.AsyncClient(timeout=15.0) as client:
         run_id = await _record_start(client, job_id, triggered_by)
         try:
-            result = await job.func()
+            result = await func()
             await _record_end(client, run_id, "ok", result, None)
             return {"job": job_id, "status": "ok", "result": result}
         except Exception as e:

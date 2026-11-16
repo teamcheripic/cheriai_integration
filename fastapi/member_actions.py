@@ -547,7 +547,7 @@ async def _preserve_member_messages(client: httpx.AsyncClient, user_id: str, mat
         return 0
 
 
-async def delete_account(user_id: str) -> dict[str, Any]:
+async def delete_account(user_id: str, *, notify: bool = True) -> dict[str, Any]:
     """
     Idempotent and retryable: every step tolerates rows already being gone,
     and the auth user is removed last so a failure part-way leaves the
@@ -563,7 +563,7 @@ async def delete_account(user_id: str) -> dict[str, Any]:
         "error": None,
     }
     try:
-        result = await _delete_account_steps(user_id, record)
+        result = await _delete_account_steps(user_id, record, notify=notify)
     except MemberActionError as e:
         record.update(status="failed", error=str(e))
         await _record_deletion(record)
@@ -577,7 +577,7 @@ async def delete_account(user_id: str) -> dict[str, Any]:
     return result
 
 
-async def _delete_account_steps(user_id: str, record: dict[str, Any]) -> dict[str, Any]:
+async def _delete_account_steps(user_id: str, record: dict[str, Any], *, notify: bool = True) -> dict[str, Any]:
     import compliance
 
     counts: dict[str, int] = {}
@@ -662,7 +662,8 @@ async def _delete_account_steps(user_id: str, record: dict[str, Any]) -> dict[st
         counts["onesignal_user_deleted"] = int(await _delete_onesignal_user(user_id))
 
         # Confirmation goes out while the login still exists (soft failure).
-        record["confirmation_sent"] = await _send_deletion_confirmation(recipient)
+        # An admin bulk wipe passes notify=False: no email to every member.
+        record["confirmation_sent"] = await _send_deletion_confirmation(recipient) if notify else False
 
         # Finally remove the login itself; this also revokes refresh tokens.
         a = await client.delete(f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}", headers=_HEADERS)
