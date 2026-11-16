@@ -60,10 +60,12 @@ TOKEN_TTL_SECONDS = 120
 TOKEN_VERSION = 1
 TIER_LEVEL = {"basic": 0, "premium-lite": 1, "premium": 2}
 TIER_LABEL = {"basic": "Free", "premium-lite": "Premium Lite", "premium": "Premium"}
-_KIND_CODE = {"merchant": "m", "experience": "e"}
+# Experiences only (Gifts / merchants removed from scope, 2026-11-16). A pass
+# minted for a merchant before that no longer decodes ("invalid_token").
+_KIND_CODE = {"experience": "e"}
 _CODE_KIND = {v: k for k, v in _KIND_CODE.items()}
-_OFFER_TABLE = {"merchant": "merchants", "experience": "experiences"}
-_OFFER_COLUMN = {"merchant": "merchant_id", "experience": "experience_id"}
+_OFFER_TABLE = {"experience": "experiences"}
+_OFFER_COLUMN = {"experience": "experience_id"}
 
 
 # --------------------------------------------------------------------------
@@ -179,7 +181,7 @@ def _check_offer_and_tier(offer: dict, member: dict, tier: str) -> None:
 # --------------------------------------------------------------------------
 
 class TokenRequest(BaseModel):
-    offer_kind: Literal["merchant", "experience"]
+    offer_kind: Literal["experience"]
     offer_id: str = Field(min_length=1, max_length=64)
 
 

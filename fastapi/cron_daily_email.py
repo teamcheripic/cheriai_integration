@@ -663,7 +663,9 @@ def unsubscribe_url(user_id: str) -> str | None:
     token = make_unsubscribe_token(user_id)
     if not token:
         return None
-    base = (os.getenv("PUBLIC_API_BASE_URL") or DEFAULT_PUBLIC_API_BASE_URL).rstrip("/")
+    from app_config import peek_config
+
+    base = (peek_config("public_api_base_url") or os.getenv("PUBLIC_API_BASE_URL") or DEFAULT_PUBLIC_API_BASE_URL).rstrip("/")
     return f"{base}/emails/unsubscribe?token={quote(token)}"
 
 

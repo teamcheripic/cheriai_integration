@@ -360,74 +360,24 @@ async def lifespan(app: FastAPI):
 
         # UTC-anchored so the daily job doesn't drift on DST-observing hosts.
         scheduler = AsyncIOScheduler(timezone="UTC")
-        # Local memory of what crontab we scheduled the daily job with,
-        # so a supervisor tick can detect a change and reschedule.
-        # APScheduler Job objects don't allow arbitrary attribute
-        # assignment (reported AttributeError 2026-09-25), so we keep
-        # the mapping in a closure-local variable instead.
-        current_daily_cron: dict[str, str] = {}
+        # Every job (daily nudge, introduction delivery, Stripe reconcile,
+        # KYC retention) is reconciled against its admin settings in
+        # app_config — see scheduled_jobs.py. Saving settings in the admin
+        # panel triggers a reconcile immediately; this tick is the safety net.
+        import scheduled_jobs
 
-        async def _reconcile_daily_nudge() -> None:
-            try:
-                enabled = await daily_email_enabled_async()
-                wanted = (await daily_email_crontab_async()) or "30 8 * * *"
-                job = scheduler.get_job("daily_match_nudge")
-                if not enabled:
-                    if job:
-                        scheduler.remove_job("daily_match_nudge")
-                        current_daily_cron.pop("expr", None)
-                        logger.info("Daily email cron DISARMED (admin toggle off).")
-                    return
-                # enabled — decide add vs. reschedule vs. leave alone
-                current = current_daily_cron.get("expr")
-                if job is None:
-                    scheduler.add_job(
-                        run_daily_email_cron,
-                        CronTrigger.from_crontab(wanted, timezone="UTC"),
-                        id="daily_match_nudge",
-                        max_instances=1,
-                        coalesce=True,
-                        misfire_grace_time=3600,
-                    )
-                    current_daily_cron["expr"] = wanted
-                    logger.info("Daily email cron ARMED (UTC crontab: '%s').", wanted)
-                elif current != wanted:
-                    scheduler.reschedule_job(
-                        "daily_match_nudge",
-                        trigger=CronTrigger.from_crontab(wanted, timezone="UTC"),
-                    )
-                    current_daily_cron["expr"] = wanted
-                    logger.info("Daily email cron RESCHEDULED (UTC crontab: '%s').", wanted)
-            except Exception as e:
-                logger.error("Cron supervisor tick failed: %r", e, exc_info=True)
-
-        # First reconciliation before the loop starts, so a healthy DB row
-        # is honored immediately at boot instead of waiting up to 60s.
-        await _reconcile_daily_nudge()
-
+        await scheduled_jobs.reconcile(scheduler)
         scheduler.add_job(
-            _reconcile_daily_nudge,
+            scheduled_jobs.reconcile,
             IntervalTrigger(minutes=15),
-            id="daily_nudge_supervisor",
+            args=[scheduler],
+            id="jobs_supervisor",
             max_instances=1,
             coalesce=True,
         )
-        _schedule_stripe_reconcile(scheduler)
-        try:
-            import kyc_retention
-
-            kyc_retention.schedule(scheduler)  # ENABLE_KYC_RETENTION, default on
-        except Exception as e:
-            logger.error("Could not arm the KYC retention job: %r", e)
-        try:
-            import introduction_delivery
-
-            introduction_delivery.schedule(scheduler)  # ENABLE_INTRO_DELIVERY, default on
-        except Exception as e:
-            logger.error("Could not arm the introduction delivery job: %r", e)
         scheduler.start()
         app.state.scheduler = scheduler
-        logger.info("Cron supervisor running (15-min reconcile against app_config).")
+        logger.info("Job supervisor running (15-min reconcile against app_config).")
     except Exception as e:
         logger.error("Could not start email scheduler: %r", e, exc_info=True)
 
@@ -1840,18 +1790,24 @@ async def chat_notify_unread_message(
         #     subsequent message silent for the full hour — wrong for
         #     real-time chat. send_push_notification only accepts the
         #     window in hours, so 10 seconds is passed as 10/3600 h.
+        from notification_copy import push_template
         from push_notifications import send_push_notification
         # Generic lock-screen preview by default (handoff §14) — no sender
-        # name or message text on the lock screen.
-        await send_push_notification(
-            user_id=req.receiver_user_id,
-            title="New message in your Red Room",
-            body="Open CheriPic to read it.",
-            campaign="red_room_message_unread",
-            url=f"/#/chat/{caller_user_id}",
-            dedup_window_hours=10 / 3600,
-            related_user_id=caller_user_id,
-        )
+        # name or message text on the lock screen. Copy is admin-editable.
+        copy = await push_template("red_room_message_unread", {
+            "title": "New message in your Red Room", "body": "Open CheriPic to read it.",
+            "url": "/#/chat/{{other_user_id}}", "dedup_window_hours": 10 / 3600,
+        })
+        if copy is not None:
+            await send_push_notification(
+                user_id=req.receiver_user_id,
+                title=copy["title"],
+                body=copy["body"],
+                campaign="red_room_message_unread",
+                url=(copy.get("url") or "/#/chat/{{other_user_id}}").replace("{{other_user_id}}", caller_user_id),
+                dedup_window_hours=float(copy.get("dedup_window_hours", 10 / 3600)),
+                related_user_id=caller_user_id,
+            )
     except Exception as e:
         logger.error("[chat-notify-unread] failed: %r", e, exc_info=True)
     return {"ok": True}
@@ -2080,6 +2036,27 @@ async def admin_simulate_auth_email(
     return await handle_send_email(payload)
 
 
+@app.get("/admin/jobs", tags=["Admin"])
+async def admin_list_jobs(admin_user_id: str = Depends(get_current_admin_id)):
+    """Scheduled jobs with their admin settings and next run (history: job_runs)."""
+    import scheduled_jobs
+
+    return {"jobs": await scheduled_jobs.status(getattr(app.state, "scheduler", None))}
+
+
+@app.post("/admin/jobs/{job_id}/run", tags=["Admin"])
+async def admin_run_job(job_id: str, admin_user_id: str = Depends(get_current_admin_id)):
+    """Run a scheduled job now (recorded in job_runs as triggered_by=admin)."""
+    import asyncio
+    import scheduled_jobs
+
+    if job_id not in scheduled_jobs.JOBS:
+        raise HTTPException(status_code=404, detail={"code": "unknown_job", "message": "Unknown job."})
+    logger.warning("[jobs] %s run now by admin=%s", job_id, admin_user_id)
+    asyncio.create_task(scheduled_jobs.run_job(job_id, f"admin:{admin_user_id}"))
+    return {"started": True, "job": job_id}
+
+
 @app.post("/admin/invalidate-app-config-cache", tags=["Admin"])
 async def admin_invalidate_app_config_cache(
     admin_user_id: str = Depends(get_current_admin_id),
@@ -2097,6 +2074,18 @@ async def admin_invalidate_app_config_cache(
     """
     logger.info("[app-config-cache] invalidated by admin=%s", admin_user_id)
     invalidate_config_cache()
+    try:
+        import notification_copy
+
+        notification_copy.invalidate()  # push copy edits apply immediately too
+    except Exception:
+        pass
+    try:
+        import scheduled_jobs
+
+        await scheduled_jobs.reconcile(getattr(app.state, "scheduler", None))  # job switches apply now
+    except Exception as e:
+        logger.warning("[app-config-cache] job reconcile failed: %r", e)
     return {"ok": True}
 
 

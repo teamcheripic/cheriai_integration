@@ -54,11 +54,10 @@ def delivery_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
-def _max_members() -> int:
-    try:
-        return max(1, int(os.getenv("INTRO_DELIVERY_MAX") or "5000"))
-    except ValueError:
-        return 5000
+async def _max_members() -> int:
+    from app_config import get_int
+
+    return max(1, await get_int("intro_delivery_max", env_key="INTRO_DELIVERY_MAX", default=5000))
 
 
 def wants_introductions(bio: Any) -> bool:
@@ -107,10 +106,14 @@ async def _deliver(client: httpx.AsyncClient, user_id: str) -> Optional[int]:
 
 
 async def _notify(client: httpx.AsyncClient, user_id: str, added: int) -> None:
+    from notification_copy import push_template
+
+    copy = await push_template("match_available", {"title": TITLE, "body": BODY, "url": URL, "dedup_window_hours": 20})
+    title, body = (copy or {}).get("title", TITLE), (copy or {}).get("body", BODY)
     try:
         await client.post(
             f"{REST}/notifications",
-            json={"user_id": user_id, "type": "match_available", "title": TITLE, "body": BODY},
+            json={"user_id": user_id, "type": "match_available", "title": title, "body": body},
             headers={**HEADERS, "Prefer": "return=minimal"},
         )
     except Exception as e:
@@ -118,10 +121,12 @@ async def _notify(client: httpx.AsyncClient, user_id: str, added: int) -> None:
     try:
         from push_notifications import send_push_notification
 
-        await send_push_notification(
-            user_id=user_id, title=TITLE, body=BODY, campaign="match_available",
-            url=URL, data={"added": added}, dedup_window_hours=20,
-        )
+        if copy is not None:  # None = push turned off for this event in the admin panel
+            await send_push_notification(
+                user_id=user_id, title=title, body=body, campaign="match_available",
+                url=copy.get("url") or URL, data={"added": added},
+                dedup_window_hours=float(copy.get("dedup_window_hours", 20)),
+            )
     except Exception as e:
         logger.warning("[intro-delivery] push failed for a member: %r", e)
 
@@ -129,7 +134,7 @@ async def _notify(client: httpx.AsyncClient, user_id: str, added: int) -> None:
 async def run_intro_delivery() -> dict[str, int]:
     counts = {"members": 0, "delivered_members": 0, "introductions": 0, "errors": 0}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        members = await _members(client, _max_members())
+        members = await _members(client, await _max_members())
         counts["members"] = len(members)
         for uid in members:
             try:

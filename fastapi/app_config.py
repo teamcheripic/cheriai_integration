@@ -121,6 +121,22 @@ async def get_bool(key: str, env_key: str | None = None, default: bool = False) 
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def peek_config(key: str, default: str | None = None) -> str | None:
+    """Synchronous read of the last-fetched app_config value (no network).
+    For call sites that can't await (module constants, sync helpers). The
+    cache is refreshed by any async get_* call (60s) and by the scheduler
+    supervisor tick, so admin changes land within minutes."""
+    v = _cache.get(key)
+    return v if v else default
+
+
+def peek_int(key: str, default: int) -> int:
+    try:
+        return int(peek_config(key) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def invalidate_config_cache() -> None:
     """Reset the cache so the next get_config triggers a refetch."""
     global _cache_at

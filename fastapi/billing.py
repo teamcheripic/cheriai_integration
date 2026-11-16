@@ -60,7 +60,10 @@ def membership_expired(row: Optional[dict], now: Optional[datetime] = None) -> b
         return False
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
-    return end < (now or datetime.now(timezone.utc)) - timedelta(days=MEMBERSHIP_GRACE_DAYS)
+    from app_config import peek_int
+
+    grace = peek_int("membership_grace_days", MEMBERSHIP_GRACE_DAYS)  # admin-editable
+    return end < (now or datetime.now(timezone.utc)) - timedelta(days=grace)
 
 
 # Lazy-imported so the module loads even if stripe isn't pip-installed yet

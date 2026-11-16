@@ -23,6 +23,8 @@ from typing import Any, Optional, Union, Tuple
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or None
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+from app_config import peek_config  # noqa: E402  (admin override of the model)
 OPENAI_BASE = "https://api.openai.com/v1"
 
 _DEFAULT_SYSTEM = (
@@ -175,7 +177,8 @@ async def send_to_llm_with_usage(
         return f"[MOCK LLM] {user_msg[:160]}", mock_usage
 
     payload = {
-        "model": OPENAI_MODEL,
+        # Admin-editable (app_config openai_model); env/default as fallback.
+        "model": peek_config("openai_model", OPENAI_MODEL) or OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": system_msg},
             {"role": "user", "content": user_msg},

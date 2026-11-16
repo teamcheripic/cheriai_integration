@@ -40,8 +40,9 @@ VENDOR = "vendor-key-abc"
 def env(monkeypatch):
     monkeypatch.setenv("CHERIPASS_TOKEN_SECRET", "unit-test-secret")
     monkeypatch.setenv("CHERIPASS_VENDOR_KEYS", f"other-key, {VENDOR}")
-    state = {"tier": "premium-lite", "merchant": {"id": M, "name": "Dining Partner", "title": "15% off", "is_active": True,
-                                                  "membership_tier": "premium-lite"},
+    # M = a tier-gated dining experience, E = a free experience.
+    state = {"tier": "premium-lite", "dining": {"id": M, "title": "Dining Partner", "is_active": True,
+                                                "membership_tier": "premium-lite"},
              "experience": {"id": E, "title": "Sunset cruise", "is_active": True, "membership_tier": None},
              "profile": {"user_id": U, "nick_name": "Sam", "is_active": True}, "claims": []}
 
@@ -53,8 +54,11 @@ def env(monkeypatch):
     app.include_router(cheripass.router)
     app.dependency_overrides[get_current_user_id] = lambda: U
     with respx.mock(assert_all_called=False) as mock:
-        mock.get(f"{REST}/merchants").mock(side_effect=lambda r: httpx.Response(200, json=[state["merchant"]] if state["merchant"] else []))
-        mock.get(f"{REST}/experiences").mock(side_effect=lambda r: httpx.Response(200, json=[state["experience"]]))
+        def experiences(request):
+            row = state["dining"] if request.url.params.get("id") == f"eq.{M}" else state["experience"]
+            return httpx.Response(200, json=[row] if row else [])
+
+        mock.get(f"{REST}/experiences").mock(side_effect=experiences)
         mock.get(f"{REST}/user_profiles").mock(side_effect=lambda r: httpx.Response(200, json=[state["profile"]]))
 
         def claims_get(request):
@@ -75,7 +79,7 @@ def env(monkeypatch):
         yield state, TestClient(app)
 
 
-def _token(client, kind="merchant", oid=M):
+def _token(client, kind="experience", oid=M):
     return client.post("/cheripass/token", json={"offer_kind": kind, "offer_id": oid})
 
 
@@ -93,7 +97,7 @@ def test_eligible_member_gets_short_lived_signed_token(env):
     assert body["display_name"] == "Sam" and body["tier_label"] == "Premium Lite" and body["offer_title"] == "Dining Partner"
     assert body["expires_in"] == 120
     payload = cheripass.decode_token(body["token"])
-    assert payload["u"] == U and payload["o"] == M and payload["k"] == "m" and payload["t"] == "premium-lite"
+    assert payload["u"] == U and payload["o"] == M and payload["k"] == "e" and payload["t"] == "premium-lite"
     assert payload["e"] - payload["i"] == 120 and payload["n"]
     # No legal name / email / contact in the token.
     assert "@" not in base64.urlsafe_b64decode(body["token"].split(".")[0] + "==").decode()
@@ -118,17 +122,19 @@ def test_ineligible_tier_is_403(env):
 def test_inactive_offer_is_410_not_an_upsell(env):
     state, client = env
     state["tier"] = "basic"  # even when the tier is also insufficient, withdrawn wins (never a payment cure)
-    state["merchant"]["is_active"] = False
+    state["dining"]["is_active"] = False
     r = _token(client)
     assert r.status_code == 410 and r.json()["detail"]["code"] == "offer_inactive"
 
 
 def test_missing_offer_and_bad_id(env):
     state, client = env
-    state["merchant"] = None
+    state["dining"] = None
     assert _token(client).json()["detail"]["code"] == "offer_not_found"
     assert _token(client, oid="not-a-uuid").status_code == 400
     assert client.post("/cheripass/token", json={"offer_kind": "voucher", "offer_id": M}).status_code == 422
+    # Gifts were removed from scope: a merchant pass can't be minted any more.
+    assert client.post("/cheripass/token", json={"offer_kind": "merchant", "offer_id": M}).status_code == 422
 
 
 def test_suspended_account_is_refused(env):
@@ -141,7 +147,7 @@ def test_suspended_account_is_refused(env):
 def test_token_requires_auth():
     app = FastAPI()
     app.include_router(cheripass.router)
-    assert TestClient(app).post("/cheripass/token", json={"offer_kind": "merchant", "offer_id": M}).status_code == 401
+    assert TestClient(app).post("/cheripass/token", json={"offer_kind": "experience", "offer_id": M}).status_code == 401
 
 
 # ------------------------------------------------------------------ verify
@@ -154,7 +160,7 @@ def test_vendor_redeems_once_then_already_redeemed(env):
     assert first.json()["tier_label"] == "Premium Lite" and first.json()["display_name"] == "Sam"
     assert len(state["claims"]) == 1
     claim = state["claims"][0]
-    assert claim["user_id"] == U and claim["merchant_id"] == M and claim["is_used"] is True and claim["used_at"]
+    assert claim["user_id"] == U and claim["experience_id"] == M and claim["is_used"] is True and claim["used_at"]
     second = _verify(client, token)
     assert second.status_code == 200 and second.json()["status"] == "already_redeemed"
     assert len(state["claims"]) == 1  # no second row
@@ -190,7 +196,7 @@ def test_token_signed_with_other_secret_rejected(env, monkeypatch):
 
 def test_expired_token_rejected(env):
     state, client = env
-    token, _ = cheripass.issue_token(uid=U, offer_kind="merchant", offer_id=M, tier="premium-lite", now=time.time() - 121)
+    token, _ = cheripass.issue_token(uid=U, offer_kind="experience", offer_id=M, tier="premium-lite", now=time.time() - 121)
     r = _verify(client, token)
     assert r.status_code == 410 and r.json()["detail"]["code"] == "token_expired"
     assert state["claims"] == []
@@ -202,7 +208,7 @@ def test_verify_rechecks_tier_and_offer_now(env):
     state["tier"] = "basic"  # membership lapsed after the pass was shown
     assert _verify(client, token).json()["detail"]["code"] == "tier_ineligible"
     state["tier"] = "premium-lite"
-    state["merchant"]["is_active"] = False  # partner withdrew the offer
+    state["dining"]["is_active"] = False  # partner withdrew the offer
     assert _verify(client, token).json()["detail"]["code"] == "offer_inactive"
     assert state["claims"] == []
 

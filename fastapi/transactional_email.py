@@ -338,7 +338,9 @@ async def send_transactional_email(
         # delivers both — a missing email template or a Resend outage must
         # not silence push too.
         try:
-            push_cfg = NOTIFICATION_REGISTRY.get(template_slug)
+            # Admin-editable copy (notification_templates, 065) over the built-in registry.
+            from notification_copy import push_template
+            push_cfg = await push_template(template_slug, NOTIFICATION_REGISTRY.get(template_slug))
             if push_cfg is not None and not push_pref_on:
                 logger.info(
                     "[transactional_email] push skipped for %s (slug=%s) — member opted out of push",
