@@ -73,7 +73,14 @@ def test_endpoint_requires_exact_phrase(monkeypatch):
 
     main.app.dependency_overrides[auth.get_current_admin_id] = lambda: ADMIN
     started = []
-    monkeypatch.setattr("asyncio.create_task", lambda coro: started.append(coro) or coro.close())
+    from unittest.mock import MagicMock
+
+    def fake_task(coro):
+        started.append(coro)
+        coro.close()
+        return MagicMock()  # main holds the task until it finishes (_keep_task)
+
+    monkeypatch.setattr("asyncio.create_task", fake_task)
     try:
         c = TestClient(main.app)
         r = c.post("/admin/wipe/members", json={"confirm": "delete all"})
@@ -96,3 +103,44 @@ async def test_delete_account_notify_false_sends_no_email(monkeypatch):
     import inspect
     src = inspect.getsource(member_actions._delete_account_steps)
     assert "if notify else False" in src  # the email is skipped when notify=False
+
+
+def test_admin_single_delete_runs_full_deletion_and_refuses_admins(monkeypatch):
+    import auth
+    import main
+
+    calls = []
+
+    async def fake_targets():
+        return {"targets": [M1], "admins": 1, "protected": 1}
+
+    async def fake_delete(uid, *, notify=True):
+        calls.append((uid, notify))
+        return {"ok": True, "status": "completed"}
+
+    monkeypatch.setattr(admin_wipe, "wipe_targets", fake_targets)
+    monkeypatch.setattr(member_actions, "delete_account", fake_delete)
+    main.app.dependency_overrides[auth.get_current_admin_id] = lambda: ADMIN
+    try:
+        c = TestClient(main.app)
+        assert c.post(f"/admin/users/{M1}/delete").json()["status"] == "completed"
+        assert calls == [(M1, False)]
+        r = c.post(f"/admin/users/{ADMIN}/delete")
+        assert r.status_code == 409 and r.json()["detail"]["code"] == "not_deletable"
+        assert c.post("/admin/users/not-a-uuid/delete").status_code == 422
+        assert calls == [(M1, False)]
+    finally:
+        main.app.dependency_overrides.clear()
+
+
+def test_match_pool_view_is_not_a_delete_target():
+    # cheri_ai_match_pool is a view (055); deleting from it stopped every
+    # deletion with "delete_failed_cheri_ai_match_pool" (live, 2026-11-22).
+    assert "cheri_ai_match_pool" not in {t for t, _ in member_actions._DELETE_TARGETS}
+
+
+def test_read_only_view_answer_is_recognised():
+    view = httpx.Response(400, json={"code": "55000", "message": 'cannot delete from view "x"', "details": "Views that do not select from a single table or view are not automatically updatable."})
+    fk = httpx.Response(409, json={"code": "23503", "message": "update or delete on table violates foreign key constraint"})
+    assert member_actions._is_read_only_view(view) is True
+    assert member_actions._is_read_only_view(fk) is False

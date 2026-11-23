@@ -243,7 +243,10 @@ _DELETE_TARGETS: list[tuple[str, str]] = [
     ("messages", "receiver_id"),
     ("chat_history", "user_id"),
     ("cheri_ai_user_memory", "user_id"),
-    ("cheri_ai_match_pool", "user_id"),
+    # cheri_ai_match_pool is NOT listed: it's a view (055) over the profile
+    # tables, so a member's pool row disappears with user_profiles /
+    # cheri_ai_user_profiles. Deleting from the view itself is refused and
+    # used to stop every deletion ("delete_failed_cheri_ai_match_pool").
     ("cheri_ai_daily_usage", "user_id"),
     ("cheri_ai_usage_periods", "user_id"),
     ("cheri_ai_user_profiles", "user_id"),
@@ -279,6 +282,19 @@ RETAINED_TABLES: list[str] = [
     # preserved evidence are kept on deletion.
     "purchase_agreements", "moderation_actions", "preserved_content",
 ]
+
+
+def _is_read_only_view(resp: httpx.Response) -> bool:
+    """PostgREST/Postgres refusing a DELETE because the target is a view that
+    can't be written to (55000 'cannot delete from view', 0A000 not supported)."""
+    try:
+        body = resp.json()
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    text = f"{body.get('message') or ''} {body.get('details') or ''} {body.get('hint') or ''}".lower()
+    return str(body.get("code") or "") in ("55000", "0A000") and "view" in text
 
 
 def _stripe_sub_already_gone(err: Exception) -> bool:
@@ -633,6 +649,10 @@ async def _delete_account_steps(user_id: str, record: dict[str, Any], *, notify:
         for table, col in _DELETE_TARGETS:
             d = await client.delete(f"{_REST}/{table}", params={col: f"eq.{user_id}"}, headers=_HEADERS)
             if d.status_code >= 300 and d.status_code != 404:
+                if _is_read_only_view(d):
+                    # A view over other tables: its rows go with them.
+                    logger.warning("[delete-account] %s is a read-only view; skipped", table)
+                    continue
                 logger.error("[delete-account] %s.%s failed [%s]: %s", table, col, d.status_code, d.text[:200])
                 raise MemberActionError(f"delete_failed_{table}")
             try:

@@ -428,7 +428,7 @@ async def _rate_limit_exceeded(request: Request, exc: RateLimitExceeded):
 
 
 # --- Feature routers (added by integration) ---
-for _mod in ("media", "cheripass", "official", "readiness", "payments_api", "compliance_api"):
+for _mod in ("media", "cheripass", "official", "readiness", "payments_api", "compliance_api", "qa_login"):
     try:
         app.include_router(__import__(_mod).router)
     except ModuleNotFoundError:
@@ -2053,8 +2053,20 @@ async def admin_run_job(job_id: str, admin_user_id: str = Depends(get_current_ad
     if job_id not in scheduled_jobs.JOBS:
         raise HTTPException(status_code=404, detail={"code": "unknown_job", "message": "Unknown job."})
     logger.warning("[jobs] %s run now by admin=%s", job_id, admin_user_id)
-    asyncio.create_task(scheduled_jobs.run_job(job_id, f"admin:{admin_user_id}"))
+    _keep_task(asyncio.create_task(scheduled_jobs.run_job(job_id, f"admin:{admin_user_id}")))
     return {"started": True, "job": job_id}
+
+
+# Admin-started background runs (job "run now", member wipe). asyncio keeps
+# only a weak reference to a task, so an unreferenced one can be garbage-
+# collected part-way through; holding it here until it finishes prevents that.
+_BACKGROUND_TASKS: set = set()
+
+
+def _keep_task(task):
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
 
 
 class AdminWipeMembersRequest(BaseModel):
@@ -2086,8 +2098,36 @@ async def admin_wipe_members(req: AdminWipeMembersRequest, admin_user_id: str = 
         raise HTTPException(status_code=422, detail={"code": "confirmation_required",
                                                      "message": f'Type "{WIPE_MEMBERS_PHRASE}" to confirm.'})
     logger.warning("[wipe-members] started by admin=%s", admin_user_id)
-    asyncio.create_task(scheduled_jobs.run_recorded("wipe_members", admin_wipe.wipe_members, f"admin:{admin_user_id}"))
+    _keep_task(asyncio.create_task(scheduled_jobs.run_recorded("wipe_members", admin_wipe.wipe_members, f"admin:{admin_user_id}")))
     return {"started": True, "job": "wipe_members"}
+
+
+@app.post("/admin/users/{user_id}/delete", tags=["Admin"])
+async def admin_delete_member(user_id: str, admin_user_id: str = Depends(get_current_admin_id)):
+    """Delete one member completely (Users page → Delete): the same
+    account-deletion process as the app, without the confirmation email.
+    Admin and protected accounts are refused. The outcome is recorded in
+    account_deletions like any deletion."""
+    import uuid as _uuid
+
+    import admin_wipe
+    from member_actions import MemberActionError, delete_account
+
+    try:
+        _uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail={"code": "invalid_user", "message": "Not a member id."})
+    plan = await admin_wipe.wipe_targets()
+    if user_id not in set(plan["targets"]):
+        raise HTTPException(status_code=409, detail={"code": "not_deletable",
+                                                     "message": "Admin and protected accounts can't be deleted here (or the member is already gone)."})
+    logger.warning("[admin-delete] member deleted by admin=%s", admin_user_id)
+    try:
+        return await delete_account(user_id, notify=False)
+    except MemberActionError as e:
+        code = str(e)
+        msg = "This member is under a legal hold." if code == "legal_hold" else f"Deletion stopped at step {code}."
+        raise HTTPException(status_code=409 if code == "legal_hold" else 500, detail={"code": code, "message": msg})
 
 
 @app.post("/admin/invalidate-app-config-cache", tags=["Admin"])

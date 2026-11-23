@@ -64,6 +64,9 @@ RATE_LIMITS = {
     "ai_report": _rl("AI_REPORT", "10/hour"),
     "me_export": _rl("ME_EXPORT", "3/day"),
     "admin_moderation": _rl("ADMIN_MODERATION", "60/minute"),
+    # Admin-controlled test login (qa_login.py)
+    "test_login_check": _rl("TEST_LOGIN_CHECK", "20/minute"),
+    "test_login": _rl("TEST_LOGIN", "10/minute"),
 }
 
 limiter = Limiter(
