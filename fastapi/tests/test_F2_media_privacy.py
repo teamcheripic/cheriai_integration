@@ -90,11 +90,29 @@ def test_make_blurred_jpeg_downscales_and_destroys_detail():
     out = media.make_blurred_jpeg(src)
     im = Image.open(io.BytesIO(out))
     assert im.format == "JPEG"
-    assert max(im.size) <= 320
+    assert max(im.size) <= media.BLUR_OUT_PX
     # The 1-px white stripes are gone: neighbouring pixels are nearly equal.
     px = [im.getpixel((x, im.size[1] // 2)) for x in range(10, 30)]
     spread = max(p[1] for p in px) - min(p[1] for p in px)
     assert spread < 25
+
+
+def test_blur_keeps_no_face_scale_detail():
+    """Lighter blur (2026-11-24) still destroys anything finer than ~1/48 of
+    the photo: a 12 px checkerboard (eye/mouth scale on an 800 px portrait)
+    comes out flat."""
+    im = Image.new("RGB", (600, 800), (128, 128, 128))
+    for x in range(0, 600):
+        for y in range(0, 800):
+            if (x // 12 + y // 12) % 2:
+                im.putpixel((x, y), (255, 255, 255))
+            else:
+                im.putpixel((x, y), (0, 0, 0))
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG")
+    out = Image.open(io.BytesIO(media.make_blurred_jpeg(buf.getvalue()))).convert("L")
+    row = [out.getpixel((x, out.size[1] // 2)) for x in range(40, 200)]
+    assert max(row) - min(row) < 40
 
 
 # --------------------------------------------------------------------------
@@ -118,7 +136,7 @@ def test_blurred_creates_derivative_for_own_photo():
     assert req.headers["x-upsert"] == "true"
     assert req.headers["content-type"] == "image/jpeg"
     assert req.headers["authorization"] == "Bearer service-test-key"  # server-side only
-    assert max(Image.open(io.BytesIO(req.content)).size) <= 320
+    assert max(Image.open(io.BytesIO(req.content)).size) <= media.BLUR_OUT_PX
 
 
 @pytest.mark.parametrize(

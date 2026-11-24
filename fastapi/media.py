@@ -130,11 +130,18 @@ def is_blur_path(path: str) -> bool:
 # Image processing
 # --------------------------------------------------------------------------
 
+# Blur strength (owner feedback 2026-11-24: the old 24 px version showed only
+# colour). 48 px keeps hair, outfit and pose readable while the face stays
+# unrecognisable; the app adds only a light extra blur on top.
+BLUR_TINY_PX = 48
+BLUR_OUT_PX = 480
+
+
 def make_blurred_jpeg(data: bytes) -> bytes:
     """
-    Heavy, irreversible blur: downscale to ≤24 px on the long side (discards
-    detail), blur, upscale to ≤320 px, blur again, JPEG q=60. The result
-    shows colour/shape only — no recognisable face.
+    Irreversible blur: downscale to ≤BLUR_TINY_PX on the long side (discards
+    facial detail), blur, upscale to ≤BLUR_OUT_PX, blur again, JPEG q=70.
+    Shape, hair and clothing remain visible; the face is not recognisable.
     """
     from PIL import Image, ImageFilter, ImageOps  # lazy: optional at import
 
@@ -144,14 +151,14 @@ def make_blurred_jpeg(data: bytes) -> bytes:
         w, h = im.size
         if not w or not h:
             raise ValueError("empty image")
-        tiny_scale = 24 / max(w, h)
+        tiny_scale = min(1.0, BLUR_TINY_PX / max(w, h))
         tiny = im.resize((max(1, round(w * tiny_scale)), max(1, round(h * tiny_scale))), Image.BILINEAR)
-        tiny = tiny.filter(ImageFilter.GaussianBlur(1.5))
-        out_scale = 320 / max(w, h) if max(w, h) > 320 else 1.0
+        tiny = tiny.filter(ImageFilter.GaussianBlur(1.0))
+        out_scale = BLUR_OUT_PX / max(w, h) if max(w, h) > BLUR_OUT_PX else 1.0
         out = tiny.resize((max(1, round(w * out_scale)), max(1, round(h * out_scale))), Image.BICUBIC)
-        out = out.filter(ImageFilter.GaussianBlur(8))
+        out = out.filter(ImageFilter.GaussianBlur(3))
         buf = io.BytesIO()
-        out.save(buf, format="JPEG", quality=60, optimize=True)
+        out.save(buf, format="JPEG", quality=70, optimize=True)
         return buf.getvalue()
 
 
@@ -374,6 +381,10 @@ async def media_photos_batch(req: BatchRequest, response: Response, user_id: str
 
 class BackfillRequest(BaseModel):
     limit: int = Field(25, ge=1, le=200)
+    # True: re-create every member's derivatives (e.g. after a blur-strength
+    # change), paging with `offset`; False: only members missing one.
+    regenerate: bool = False
+    offset: int = Field(0, ge=0)
 
 
 @router.post("/admin/media/backfill-blur", tags=["Media", "Admin"])
@@ -384,15 +395,17 @@ async def admin_backfill_blur(req: BackfillRequest, admin_id: str = Depends(get_
         rows = await _rest_get(client, "user_profiles", {
             "select": "user_id,avatar_url,bio",
             "avatar_url": "not.is.null",
+            "order": "user_id.asc",
             "limit": "1000",
+            "offset": str(req.offset),
         })
         for row in rows:
             if done >= req.limit:
                 break
             bio = parse_bio(row.get("bio"))
             gallery = [g for g in (bio.get("gallery_urls") or []) if isinstance(g, str)]
-            have_avatar = isinstance(bio.get("blur_url"), str)
-            have_gallery = len(bio.get("gallery_blur_urls") or []) == len(gallery)
+            have_avatar = isinstance(bio.get("blur_url"), str) and not req.regenerate
+            have_gallery = len(bio.get("gallery_blur_urls") or []) == len(gallery) and not req.regenerate
             if have_avatar and have_gallery:
                 continue
             uid = row["user_id"]
