@@ -10,7 +10,9 @@ customer and the OneSignal identity. Each deletion leaves its usual hashed
 account_deletions record.
 
 Never touched:
-  • admin accounts (admin_users) — always protected;
+  • admin accounts — any login with app_metadata.is_admin (what the panel,
+    the backend and SQL is_admin() check), plus legacy admin_users ids. A
+    wipe refuses to run if it finds no admin login at all;
   • protected_accounts (migration 067) — test / App Review demo logins;
   • members under a legal hold — skipped and reported;
   • experiences, banners, settings, policies, admin data, the audit log.
@@ -51,25 +53,43 @@ async def _ids(client: httpx.AsyncClient, table: str, column: str) -> set[str]:
         offset += PAGE
 
 
-async def _auth_user_ids(client: httpx.AsyncClient) -> set[str]:
-    """Every login (members without a profile row included)."""
-    out: set[str] = set()
+def is_admin_login(user: dict[str, Any]) -> bool:
+    """The admin panel, the backend (auth.get_current_admin_id) and SQL
+    is_admin() all recognise an admin by app_metadata.is_admin on the LOGIN.
+    The legacy admin_users table has its own ids, so it can't be relied on."""
+    meta = user.get("app_metadata") or {}
+    return meta.get("is_admin") is True or str(meta.get("is_admin")).lower() == "true"
+
+
+async def _auth_users(client: httpx.AsyncClient) -> tuple[set[str], set[str]]:
+    """(every login id, admin login ids). Members without a profile included."""
+    everyone: set[str] = set()
+    admins: set[str] = set()
     page = 1
     while True:
         r = await client.get(f"{SUPABASE_URL}/auth/v1/admin/users", params={"page": str(page), "per_page": "1000"}, headers=HEADERS)
         r.raise_for_status()
         users = (r.json() or {}).get("users") or []
-        out.update(str(u["id"]) for u in users if u.get("id"))
+        for u in users:
+            if u.get("id"):
+                everyone.add(str(u["id"]))
+                if is_admin_login(u):
+                    admins.add(str(u["id"]))
         if len(users) < 1000:
-            return out
+            return everyone, admins
         page += 1
 
 
 async def wipe_targets() -> dict[str, Any]:
     """Who a member wipe would delete, and who it keeps."""
     async with httpx.AsyncClient(timeout=30.0) as client:
-        members = (await _auth_user_ids(client)) | (await _ids(client, "user_profiles", "user_id"))
-        admins = await _ids(client, "admin_users", "id")
+        logins, admin_logins = await _auth_users(client)
+        members = logins | (await _ids(client, "user_profiles", "user_id"))
+        admins = admin_logins | (await _ids(client, "admin_users", "id"))
+        if not admin_logins:
+            # Never run a wipe that can't see a single admin login: it would
+            # mean the admin flag couldn't be read, and admins would be deleted.
+            raise RuntimeError("no_admin_login_found")
         protected = await _ids(client, "protected_accounts", "user_id")
     targets = sorted(members - admins - protected)
     return {"targets": targets, "admins": len(members & admins), "protected": len(members & protected)}

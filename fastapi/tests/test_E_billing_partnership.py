@@ -292,3 +292,36 @@ async def test_finalize_stamp_is_conditional_and_reports_state_change():
     assert q["is_active"] == "eq.true" and q["partnered_at"] == "is.null"
     assert q["partner_accepted_by_a"] == "eq.true" and q["partner_accepted_by_b"] == "eq.true"
     assert stamp.call_count == 1 and not notif.called
+
+
+@respx.mock(assert_all_called=False)
+async def test_finalize_keeps_the_couples_own_request(respx_mock):
+    """Live bug 2026-11-24: the request sweep deleted the couple's OWN accepted
+    request; matches.match_request_id references it, so the couple's
+    connection and Red Room messages vanished the moment they became official."""
+    row = {"id": "m1", "user_a_id": PA, "user_b_id": PB, "is_active": True,
+           "partner_accepted_by_a": True, "partner_accepted_by_b": True, "partnered_at": None}
+
+    def matches(request):
+        q = request.url.params
+        if q.get("partnered_at") == "not.is.null":
+            return httpx.Response(200, json=[])
+        if q.get("id") == "eq.m1":
+            return httpx.Response(200, json=[row])
+        return httpx.Response(200, json=[])
+
+    respx_mock.get(f"{PG}/matches").mock(side_effect=matches)
+    respx_mock.patch(f"{PG}/matches").mock(return_value=httpx.Response(200, json=[{**row, "partnered_at": "2026-11-24T00:00:00Z"}]))
+    req_delete = respx_mock.delete(f"{PG}/match_requests").mock(return_value=httpx.Response(200, json=[]))
+    match_delete = respx_mock.delete(f"{PG}/matches")
+    respx_mock.route(url__startswith=PG).mock(return_value=httpx.Response(200, json=[]))
+    respx_mock.route().mock(return_value=httpx.Response(200, json={}))
+    try:
+        await partnership.finalize_partnership("m1", PA)
+    except partnership.PartnershipError:
+        pass
+    assert req_delete.called, "the sweep should still clear other people's requests"
+    for call in req_delete.calls:
+        q = call.request.url.params
+        assert q.get("not.and") == f"(sender_id.in.({PA},{PB}),receiver_id.in.({PA},{PB}))", q
+    assert not match_delete.called

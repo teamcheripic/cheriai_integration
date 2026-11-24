@@ -124,3 +124,12 @@ def test_admin_accounts_never_sign_in_this_way(settings):
     mock_link(uid=ADMIN, admin=True)
     r = client().post("/auth/test-login", json={"email": "boss@cheripic.com", "code": "123456"})
     assert r.status_code == 403 and "token_hash" not in r.text
+
+
+@respx.mock
+def test_panel_admin_flag_blocks_test_login_even_without_admin_users_row(settings):
+    respx.post(f"{qa_login._AUTH}/admin/generate_link").mock(return_value=httpx.Response(
+        200, json={"id": ADMIN, "app_metadata": {"is_admin": True}, "hashed_token": "hash-x"}))
+    respx.get(f"{qa_login._REST}/admin_users").mock(return_value=httpx.Response(200, json=[]))
+    r = client().post("/auth/test-login", json={"email": "boss@cheripic.com", "code": "123456"})
+    assert r.status_code == 403 and "hash-x" not in r.text

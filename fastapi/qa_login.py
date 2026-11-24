@@ -17,7 +17,8 @@ Safety rules (enforced here, so a raw App Config edit can't loosen them):
   • off unless enabled AND test_login_until is in the future;
   • a bare "*" and whole public mail domains (*@gmail.com, …) are ignored,
     so a real member's address can never be opened with 123456;
-  • admin accounts never sign in this way (admin_users);
+  • admin accounts never sign in this way (app_metadata.is_admin on the
+    login, or a legacy admin_users row);
   • both endpoints are rate limited, and every test sign-in is logged.
 
 Flow (mobile app, AuthScreens):
@@ -166,6 +167,12 @@ async def mint_token_hash(email: str) -> str:
         token, uid = _hashed_token(body), _user_id(body)
         if not token or not uid:
             raise HTTPException(status_code=502, detail={"code": "test_login_failed", "message": "Could not sign in. Try again."})
+        from admin_wipe import is_admin_login
+
+        user = body.get("user") if isinstance(body.get("user"), dict) else body
+        if is_admin_login(user):
+            logger.warning("[test-login] refused for an admin account")
+            raise HTTPException(status_code=403, detail={"code": "test_login_unavailable", "message": "Test login isn't available for this address."})
         a = await client.get(f"{_REST}/admin_users", params={"select": "id", "id": f"eq.{uid}", "limit": "1"}, headers=_HEADERS)
         if a.status_code >= 300 or (a.json() or []):
             # Admins never get a test session (and an unreadable answer counts as admin).

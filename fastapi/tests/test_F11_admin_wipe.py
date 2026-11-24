@@ -22,11 +22,16 @@ import admin_wipe
 import member_actions
 
 ADMIN, DEMO, M1, M2, HELD, NOPROFILE = (f"{c * 8}-0000-0000-0000-000000000000" for c in "abcdef")
+# The real admin: a login flagged app_metadata.is_admin, NOT listed in the
+# legacy admin_users table (which has its own ids). Live bug 2026-11-23: the
+# wipe deleted this login because it only checked admin_users.
+PANEL_ADMIN = "99999999-0000-0000-0000-000000000000"
 
 
 def mock_people():
     respx.get(f"{admin_wipe.SUPABASE_URL}/auth/v1/admin/users").mock(return_value=httpx.Response(
-        200, json={"users": [{"id": u} for u in (ADMIN, DEMO, M1, M2, HELD, NOPROFILE)]}))
+        200, json={"users": [{"id": u} for u in (ADMIN, DEMO, M1, M2, HELD, NOPROFILE)]
+                   + [{"id": PANEL_ADMIN, "app_metadata": {"provider": "email", "is_admin": True}}]}))
     respx.get(f"{admin_wipe.REST}/user_profiles").mock(return_value=httpx.Response(
         200, json=[{"user_id": u} for u in (DEMO, M1, M2, HELD)]))
     respx.get(f"{admin_wipe.REST}/admin_users").mock(return_value=httpx.Response(200, json=[{"id": ADMIN}]))
@@ -38,7 +43,18 @@ async def test_targets_exclude_admins_and_protected_accounts():
     mock_people()
     plan = await admin_wipe.wipe_targets()
     assert set(plan["targets"]) == {M1, M2, HELD, NOPROFILE}
-    assert plan["admins"] == 1 and plan["protected"] == 1
+    assert PANEL_ADMIN not in plan["targets"]
+    assert plan["admins"] == 2 and plan["protected"] == 1
+
+
+@respx.mock
+async def test_wipe_refuses_when_no_admin_login_is_visible():
+    respx.get(f"{admin_wipe.SUPABASE_URL}/auth/v1/admin/users").mock(return_value=httpx.Response(200, json={"users": [{"id": M1}]}))
+    respx.get(f"{admin_wipe.REST}/user_profiles").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{admin_wipe.REST}/admin_users").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{admin_wipe.REST}/protected_accounts").mock(return_value=httpx.Response(200, json=[]))
+    with pytest.raises(RuntimeError, match="no_admin_login_found"):
+        await admin_wipe.wipe_targets()
 
 
 @respx.mock
@@ -56,7 +72,8 @@ async def test_wipe_deletes_without_email_and_reports_legal_holds(monkeypatch):
     out = await admin_wipe.wipe_members()
     assert {u for u, _ in calls} == {M1, M2, HELD, NOPROFILE}
     assert all(notify is False for _, notify in calls)
-    assert out == {"deleted": 3, "legal_hold": 1, "failed": 0, "kept_admins": 1, "kept_protected": 1}
+    assert PANEL_ADMIN not in {u for u, _ in calls}
+    assert out == {"deleted": 3, "legal_hold": 1, "failed": 0, "kept_admins": 2, "kept_protected": 1}
 
 
 @respx.mock

@@ -597,11 +597,19 @@ async def finalize_partnership(match_id: str, caller_user_id: str) -> dict[str, 
         # sent-requests screen — the user reported this on
         # 2026-09-24 as "should be removed everywhere including
         # intrests, connect or requests".
+        # EXCEPT the couple's own request: their matches row references it
+        # (matches.match_request_id), so deleting it removed the couple's
+        # connection and, through it, their Red Room messages the moment
+        # they became official (live, 2026-11-24).
         await _pg_delete(
             client,
             "match_requests",
             {
                 "or": (
+                    f"(sender_id.in.({partner_ids_csv}),"
+                    f"receiver_id.in.({partner_ids_csv}))"
+                ),
+                "not.and": (
                     f"(sender_id.in.({partner_ids_csv}),"
                     f"receiver_id.in.({partner_ids_csv}))"
                 ),
